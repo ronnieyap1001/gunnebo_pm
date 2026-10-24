@@ -1,0 +1,29 @@
+# Dependencies and build output
+node_modules/
+.next/
+out/
+src/generated/
+*.tsbuildinfo
+next-env.d.ts
+
+# Your data: database, uploads and backups never go to GitHub
+data/
+*.db
+*.db-wal
+*.db-shm
+*.db-journal
+exports/
+
+# Secrets
+.env
+.env.*
+!.env.example
+
+# Test and tooling output
+screenshots/
+test-results/
+playwright-report/
+coverage/
+
+# OS files
+.DS_Store
