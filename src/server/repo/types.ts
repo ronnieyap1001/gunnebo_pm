@@ -11,6 +11,7 @@ import type {
   Note,
   Project,
   ProjectField,
+  State,
   Step,
 } from "@/domain/types";
 
@@ -31,10 +32,31 @@ export interface StoredStep extends Step {
   lastOp?: string;
 }
 
+/**
+ * Readable copies written next to a project for people browsing Notion (write-only; the app never reads them).
+ * Customer / Project type become select options (commas are replaced by " ·").
+ */
+export interface ProjectMirrors {
+  customer?: string | null;
+  projectType?: string | null;
+  /** e.g. "SITA · AFL-Compact × 24 · Heathrow T5". */
+  summary?: string;
+  /** Names of the current milestones. */
+  current?: string;
+}
+
+/** Readable copies written next to a step (write-only). Without them the repo writes a simple fallback. */
+export interface StepMirrors {
+  /** Derived state (the app always re-derives it; this only colours the Notion State column). */
+  state?: State;
+  /** Formatted value, e.g. "Full PO" or "12 Nov 2026". */
+  display?: string;
+}
+
 export type MilestoneInput = Omit<Milestone, "id" | "createdAt" | "updatedAt">;
 export type ProjectFieldInput = Omit<ProjectField, "id">;
-export type ProjectInput = Omit<Project, "id" | "createdAt" | "updatedAt">;
-export type StepInput = Omit<StoredStep, "id" | "createdAt" | "updatedAt">;
+export type ProjectInput = Omit<Project, "id" | "createdAt" | "updatedAt"> & { mirrors?: ProjectMirrors };
+export type StepInput = Omit<StoredStep, "id" | "createdAt" | "updatedAt"> & { mirrors?: StepMirrors };
 export type NoteInput = Omit<Note, "id" | "createdAt">;
 
 export interface HistoryAppendInput extends Omit<HistoryEvent, "id" | "recordedAt"> {
@@ -156,6 +178,8 @@ export interface SetupStatus {
   mode: StorageMode;
   /** Plain-English explanation when something blocks the app. */
   problems: string[];
+  /** Non-blocking notes (e.g. two databases that look like the same app database). */
+  warnings?: string[];
   parentPage?: { id: string; title: string; url?: string };
   databases: { name: string; ok: boolean }[];
   /** All databases exist and the schema registry is complete. */
