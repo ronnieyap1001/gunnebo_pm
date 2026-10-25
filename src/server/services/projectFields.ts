@@ -193,29 +193,31 @@ export async function updateProjectField(ctx: Ctx, id: string, patch: ProjectFie
   }
 
   if (Object.keys(next).length === 0) return f;
-  if (await alreadyLogged(ctx)) return f;
 
-  const updated = await ctx.repo.projectFields.update(id, next);
+  // Write order: project values (converted) → History → field. A retry after a crash at any point finishes the
+  // change: values already converted are left alone, the History row is written once per opId, and the field is
+  // updated last, so its type never runs ahead of the values.
   for (const c of conversions) {
     const p = await ctx.repo.projects.get(c.projectId);
     if (!p) continue;
     await ctx.repo.projects.update(p.id, { details: { ...(p.details ?? {}), [id]: c.value } });
   }
   if (changes.length) {
+    const after = { ...f, ...next };
     await appendHistory(ctx, {
       type: EV.projectFieldUpdated,
-      summary: fieldSummary(`Updated project field "${updated.label}": ${changes.join("; ")}`),
+      summary: fieldSummary(`Updated project field "${after.label}": ${changes.join("; ")}`),
       data: {
         fieldId: id,
         key: f.key,
         changes,
         old: { label: f.label, fieldType: f.fieldType, choices: f.choices },
-        new: { label: updated.label, fieldType: updated.fieldType, choices: updated.choices },
+        new: { label: after.label, fieldType: after.fieldType, choices: after.choices },
         convertedProjects: conversions.map((c) => c.projectId),
       },
     });
   }
-  return updated;
+  return ctx.repo.projectFields.update(id, next);
 }
 
 /** Adds one choice from the project form ("Add customer…"). Returns the field and the new (or existing) choice id. */
