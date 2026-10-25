@@ -10,7 +10,7 @@ import { formatValue } from "@/domain/format";
 import { slugify } from "@/domain/slug";
 import { choicesEqual, stableStringify } from "@/domain/syncPlan";
 import type { Choice, FieldConfig, FieldType, Project, ProjectField, Value } from "@/domain/types";
-import { isEmptyValue } from "@/domain/values";
+import { isEmptyValue, isValidValue } from "@/domain/values";
 import type { ProjectFieldInput, Repo } from "@/server/repo/types";
 import {
   alreadyLogged,
@@ -97,7 +97,8 @@ export interface BlockingProject {
 
 /**
  * Converts every project's value of a field to a new type. Returns the converted values, or the projects whose
- * value can't be converted losslessly.
+ * value can't be converted losslessly. A value already in the new shape (converted by an interrupted earlier attempt)
+ * is left alone; a value that fits neither type is data, never "empty": it blocks the change.
  */
 export function planFieldRetype(
   field: Pick<ProjectField, "id" | "fieldType">,
@@ -109,8 +110,15 @@ export function planFieldRetype(
   const blocking: BlockingProject[] = [];
   for (const p of projects) {
     const v = p.details?.[field.id] ?? null;
-    if (v === null || isEmptyValue(field.fieldType, v)) {
-      if (v !== null) values.push({ projectId: p.id, value: null });
+    if (v === null) continue;
+    if (!isValidValue(field.fieldType, v)) {
+      if (!isValidValue(to, v)) {
+        blocking.push({ projectId: p.id, code: p.code, reason: `The current value is not a valid ${typeLabel(field.fieldType)} value.` });
+      }
+      continue;
+    }
+    if (isEmptyValue(field.fieldType, v)) {
+      values.push({ projectId: p.id, value: null });
       continue;
     }
     const r = convertValue(field.fieldType, to, v, hasChoices(to) ? toChoices : undefined);

@@ -14,6 +14,7 @@ const nextConfig: NextConfig = {
   // Library/template data is cached explicitly with unstable_cache + tags (see src/server/cache.ts).
   cacheComponents: false,
   poweredByHeader: false,
+  devIndicators: false,
   experimental: {
     serverActions: { bodySizeLimit: "2mb" },
   },

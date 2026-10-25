@@ -20,6 +20,7 @@ import {
   dbDescription,
   dbKeyFrom,
   parseDbMarker,
+  parseMapPointer,
   parsePropMarker,
   propertyConfig,
   type DbKey,
@@ -57,6 +58,8 @@ export interface DbEntry {
   missing: string[];
   /** Select property key → option name → option id (every option currently defined). */
   options: Record<string, Record<string, string>>;
+  /** Settings only: the page id of the 'schema.registry' row, from the `[map:…]` pointer in the description. */
+  mapPageId?: string;
 }
 
 export interface SavedMap {
@@ -238,6 +241,10 @@ function mapEntry(
     missing: [],
     options: {},
   };
+  if (key === "settings") {
+    const ptr = parseMapPointer(richTextToText(db.description));
+    if (ptr) entry.mapPageId = ptr;
+  }
   const used = new Set<string>();
   const take = (pk: string, p: DsProp) => {
     entry.props[pk] = p.id;
@@ -282,10 +289,25 @@ function linkBackRelations(dbs: Partial<Record<DbKey, DbEntry>>, dsById: Map<str
   }
 }
 
+/** A live Settings row with exactly this key, read by id (null when gone, trashed, elsewhere or another key). */
+async function settingRowById(notion: NotionLike, settings: DbEntry, pageId: string, key: string): Promise<PageObjectResponse | null> {
+  try {
+    const p = await notion.pages.retrieve({ page_id: pageId });
+    if (!isFullPage(p) || p.in_trash || p.parent.type !== "data_source_id") return null;
+    if (normPageId(p.parent.data_source_id) !== normPageId(settings.dataSourceId)) return null;
+    return titleOf(propById(p, settings.props.key)) === key ? p : null;
+  } catch (e) {
+    if (isNotionCode(e, "object_not_found") || isNotionCode(e, "validation_error")) return null;
+    throw e;
+  }
+}
+
 async function readSavedMap(notion: NotionLike, settings: DbEntry | undefined): Promise<SavedMap | null> {
   if (!settings?.props.key || !settings.props.value) return null;
   try {
-    const row = await findSettingRow(notion, settings, SETTINGS_REGISTRY_KEY);
+    const row =
+      (settings.mapPageId ? await settingRowById(notion, settings, settings.mapPageId, SETTINGS_REGISTRY_KEY) : null) ??
+      (await findSettingRow(notion, settings, SETTINGS_REGISTRY_KEY));
     if (!row) return null;
     const saved = richTextToJson<SavedMap | null>(propValueRichText(propById(row, settings.props.value)), null);
     return saved && saved.v === 1 ? saved : null;
@@ -412,6 +434,31 @@ export function isComplete(reg: Registry): boolean {
   return !!reg.parent && DB_ORDER.every((k) => reg.dbs[k] && reg.dbs[k]!.missing.length === 0);
 }
 
+/**
+ * The app can run: every database and property exists and the property-id map is saved in Settings.
+ * Cosmetic drift (missing colour options, the Steps link renamed, a database unlocked in Notion) does not count:
+ * Setup still fixes it (runSchemaStep reports done only when nothing is left), but the app is not blocked.
+ */
+export function isSchemaReady(reg: Registry): boolean {
+  return isComplete(reg) && sameSaved(reg.saved, savedMapOf(reg));
+}
+
+/** Plain-English list of the cosmetic setup work still pending (empty when none, or when the schema is not ready). */
+export function cosmeticWork(reg: Registry): string[] {
+  if (!isSchemaReady(reg)) return [];
+  const out: string[] = [];
+  if (DB_ORDER.some((k) => missingOptions(reg.dbs[k]!).length)) out.push("some colour-coded choices are missing");
+  for (const key of DB_ORDER) {
+    for (const [pk, pd] of Object.entries(SCHEMA[key].props)) {
+      const e = reg.dbs[key]!;
+      if (pd.backOf && e.props[pk] && e.propNames[pk] !== pd.name) out.push(`the link on ${e.title} is not called "${pd.name}"`);
+    }
+  }
+  const unlocked = DB_ORDER.filter((k) => !reg.dbs[k]!.locked);
+  if (unlocked.length) out.push(`${unlocked.map((k) => reg.dbs[k]!.title).join(", ")} ${unlocked.length === 1 ? "is" : "are"} unlocked`);
+  return out;
+}
+
 export function savedMapOf(reg: Registry): SavedMap {
   const dbs: SavedMap["dbs"] = {};
   for (const k of DB_ORDER) {
@@ -485,14 +532,22 @@ export async function findSettingRow(notion: NotionLike, settings: DbEntry, key:
   return null;
 }
 
-export async function upsertSettingRow(notion: NotionLike, settings: DbEntry, key: string, value: unknown): Promise<void> {
+/**
+ * Writes one Settings row (used by Setup; the repository has its own cached version). `knownId` is the row's page
+ * id when known: it is updated by id, which does not depend on the query index being current. Returns the page id.
+ */
+export async function upsertSettingRow(notion: NotionLike, settings: DbEntry, key: string, value: unknown, knownId?: string): Promise<string> {
   const properties = {
     [settings.props.key]: { title: textToRichText(key, `Setting ${key}`) },
     [settings.props.value]: { rich_text: jsonToRichText(value, `Setting ${key}`) },
   };
-  const existing = await findSettingRow(notion, settings, key);
-  if (existing) await notion.pages.update({ page_id: existing.id, properties });
-  else await notion.pages.create({ parent: { type: "data_source_id", data_source_id: settings.dataSourceId }, properties });
+  const existing = (knownId ? await settingRowById(notion, settings, knownId, key) : null) ?? (await findSettingRow(notion, settings, key));
+  if (existing) {
+    await notion.pages.update({ page_id: existing.id, properties });
+    return existing.id;
+  }
+  const created = await notion.pages.create({ parent: { type: "data_source_id", data_source_id: settings.dataSourceId }, properties });
+  return created.id;
 }
 
 // ---------------------------------------------------------------------------
@@ -536,11 +591,17 @@ function dsIdResolver(reg: Registry): (k: DbKey) => string {
   };
 }
 
-const setupMemo = new WeakMap<NotionLike, Registry>();
+const setupMemo = new WeakMap<NotionLike, { reg: Registry; at: number }>();
+/** A setup sequence reuses its registry between steps for this long. */
+const SETUP_MEMO_TTL_MS = 60_000;
 
-/** Reuses this instance's last setup registry unless the parent page's child databases changed. */
+/**
+ * During a setup sequence, reuses this instance's last setup registry unless the parent page's child databases
+ * changed. Never after setup finished (people may change things in Notion later) and never for longer than a minute.
+ */
 async function setupRegistry(notion: NotionLike, o: RegistryOptions): Promise<Registry> {
-  const memo = setupMemo.get(notion);
+  const held = setupMemo.get(notion);
+  const memo = held && Date.now() - held.at < SETUP_MEMO_TTL_MS && nextPendingStep(held.reg) !== null ? held.reg : undefined;
   if (memo?.parent) {
     const children = await listChildDatabases(notion, memo.parent.id);
     const ids = new Set(children.map((c) => normPageId(c.id)));
@@ -565,7 +626,7 @@ export async function runSchemaStep(notion: NotionLike, options?: RegistryOption
     const reg = await setupRegistry(notion, o);
     const step = nextPendingStep(reg);
     const finish = (message: string, done = false) => {
-      setupMemo.set(notion, reg);
+      setupMemo.set(notion, { reg, at: Date.now() });
       return { done, message, registry: reg };
     };
     if (!step) return finish("Notion is set up.", true);
@@ -648,8 +709,12 @@ export async function runSchemaStep(notion: NotionLike, options?: RegistryOption
       case "saveMap": {
         const settings = reg.dbs.settings!;
         const map = savedMapOf(reg);
-        await upsertSettingRow(notion, settings, SETTINGS_REGISTRY_KEY, map);
+        const id = await upsertSettingRow(notion, settings, SETTINGS_REGISTRY_KEY, map, settings.mapPageId);
         await upsertSettingRow(notion, settings, SETTINGS_SCHEMA_VERSION_KEY, SCHEMA_VERSION);
+        if (!settings.mapPageId || normPageId(settings.mapPageId) !== normPageId(id)) {
+          await notion.databases.update({ database_id: settings.databaseId, description: textToRichText(dbDescription("settings", id)) });
+          settings.mapPageId = id;
+        }
         reg.saved = map;
         return finish("Saved the property map in Settings");
       }
@@ -737,7 +802,11 @@ export function createRegistryHandle(notion: NotionLike, opts: RegistryHandleOpt
     reset() {
       memo = null;
       bypassLoader = true;
-      opts.onReset?.();
+      try {
+        opts.onReset?.();
+      } catch {
+        // A cache hook must never turn a recoverable reset into a failure.
+      }
     },
   };
   handles.add(handle);
@@ -760,17 +829,25 @@ interface ExportCursor {
   t: string | null;
   /** Ids already exported at exactly `t`. */
   s: string[];
+  /** Latest created_time seen so far in the current window. */
+  lt: string | null;
+  /** Ids seen at exactly `lt` in the current window (on any of its pages). */
+  ls: string[];
 }
 
 function encodeCursor(c: ExportCursor): string {
   return Buffer.from(JSON.stringify(c), "utf8").toString("base64url");
 }
 
+function strings(x: unknown): string[] {
+  return Array.isArray(x) ? x.filter((v): v is string => typeof v === "string") : [];
+}
+
 function decodeCursor(s: string | null): ExportCursor {
-  if (!s) return { c: null, t: null, s: [] };
+  if (!s) return { c: null, t: null, s: [], lt: null, ls: [] };
   try {
-    const c = JSON.parse(Buffer.from(s, "base64url").toString("utf8")) as ExportCursor;
-    return { c: c.c ?? null, t: c.t ?? null, s: Array.isArray(c.s) ? c.s : [] };
+    const c = JSON.parse(Buffer.from(s, "base64url").toString("utf8")) as Partial<ExportCursor>;
+    return { c: c.c ?? null, t: c.t ?? null, s: strings(c.s), lt: c.lt ?? null, ls: strings(c.ls) };
   } catch {
     throw new NotionError("The backup cursor is not valid; start the backup again.", { code: "bad_cursor" });
   }
@@ -811,6 +888,8 @@ export function simplifyValue(v: PropValue): unknown {
 export function createStorageAdmin(notion: NotionLike | (() => NotionLike), handle: RegistryHandle | (() => RegistryHandle), options?: RegistryOptions): StorageAdmin {
   const n = () => (typeof notion === "function" ? notion() : notion);
   const h = () => (typeof handle === "function" ? handle() : handle);
+  // 'seed.appliedAt' never goes away except through trashAll / resetCaches: once seen, status() stops querying it.
+  let seededSeen = false;
 
   return {
     async status(): Promise<SetupStatus> {
@@ -821,17 +900,21 @@ export function createStorageAdmin(notion: NotionLike | (() => NotionLike), hand
       }
       try {
         const reg = await h().load();
-        let seeded = false;
-        if (reg.dbs.settings && reg.dbs.settings.missing.length === 0) {
+        let seeded = seededSeen;
+        if (!seeded && reg.dbs.settings && reg.dbs.settings.missing.length === 0) {
           seeded = (await findSettingRow(n(), reg.dbs.settings, SETTINGS_SEED_KEY)) !== null;
+          seededSeen = seeded;
         }
+        const warnings = [...reg.warnings];
+        const tidy = cosmeticWork(reg);
+        if (tidy.length) warnings.push(`Setup has small fixes for the Notion databases (${tidy.join("; ")}). Open Setup to apply them.`);
         return {
           mode,
           problems: [...reg.problems],
-          warnings: [...reg.warnings],
+          warnings,
           parentPage: reg.parent ?? undefined,
           databases: DB_ORDER.map((k) => ({ name: SCHEMA[k].title, ok: !!reg.dbs[k] && reg.dbs[k]!.missing.length === 0 })),
-          schemaReady: nextPendingStep(reg) === null,
+          schemaReady: isSchemaReady(reg),
           seeded,
         };
       } catch (e) {
@@ -848,6 +931,7 @@ export function createStorageAdmin(notion: NotionLike | (() => NotionLike), hand
     },
 
     async resetCaches() {
+      seededSeen = false;
       resetRegistryCaches();
       setupMemo.delete(n());
     },
@@ -864,6 +948,7 @@ export function createStorageAdmin(notion: NotionLike | (() => NotionLike), hand
       } catch (e) {
         throw mapNotionError(e);
       } finally {
+        seededSeen = false;
         resetRegistryCaches();
         setupMemo.delete(n());
       }
@@ -904,16 +989,27 @@ export function createStorageAdmin(notion: NotionLike | (() => NotionLike), hand
             }
             return { id: p.id, createdTime: p.created_time, lastEditedTime: p.last_edited_time, url: p.url, values, other };
           });
+        // Track the latest minute of this window across ALL its pages: when the window is cut by the result cap,
+        // the next window starts at that minute and must skip every row of it already exported, including rows
+        // that came on an earlier page of this window.
+        let lt = cur.lt;
+        let ls = cur.ls;
+        for (const p of pages) {
+          if (lt === null || p.created_time > lt) {
+            lt = p.created_time;
+            ls = [p.id];
+          } else if (p.created_time === lt && !ls.includes(p.id)) {
+            ls = [...ls, p.id];
+          }
+        }
         let next: ExportCursor | null = null;
         if (res.has_more && res.next_cursor) {
-          next = { c: res.next_cursor, t: cur.t, s: cur.s };
-        } else if (res.request_status?.type === "incomplete" && pages.length) {
-          const lastT = pages[pages.length - 1].created_time;
-          const atT = pages.filter((p) => p.created_time === lastT).map((p) => p.id);
-          const s = lastT === cur.t ? [...new Set([...cur.s, ...atT])] : atT;
+          next = { c: res.next_cursor, t: cur.t, s: cur.s, lt, ls };
+        } else if (res.request_status?.type === "incomplete" && lt !== null) {
+          const s = lt === cur.t ? [...new Set([...cur.s, ...ls])] : ls;
           // A window that brings nothing new (over 10,000 rows created in one minute) cannot advance: stop.
-          const stuck = rows.length === 0 && lastT === cur.t && s.length === cur.s.length;
-          if (!stuck) next = { c: null, t: lastT, s };
+          const stuck = lt === cur.t && s.length === cur.s.length;
+          if (!stuck) next = { c: null, t: lt, s, lt: null, ls: [] };
         }
         return { rows, nextCursor: next ? encodeCursor(next) : null };
       } catch (err) {

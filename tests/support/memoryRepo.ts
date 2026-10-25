@@ -41,7 +41,7 @@ import type {
 } from "@/server/repo/types";
 import { historyHash } from "@/server/services/historyHash";
 
-export const MAX_FILE_BYTES = 4 * 1024 * 1024;
+export const MAX_FILE_BYTES = 4_000_000;
 
 export interface MemoryRepo extends Repo {
   /** Number of write calls so far (create, update, set, append). */

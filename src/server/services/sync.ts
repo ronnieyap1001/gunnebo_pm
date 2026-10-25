@@ -4,19 +4,24 @@ import "server-only";
  * selection (applySync) into a job; continueSync writes the job in batches and finalizes with ONE History row.
  * Values are never changed except by a lossless type conversion.
  */
+import { createHash } from "node:crypto";
+import { convertValue } from "@/domain/convertValue";
+import { findActivePair, isActiveEdge, wouldCreateCycle } from "@/domain/graph";
 import { remapFlow } from "@/domain/snapshot";
 import {
   applySync,
   changeHashOf,
   dismissKeyOf,
   planSync,
+  stableStringify,
   type SyncApplyResult,
   type SyncItem,
   type SyncProjectInput,
 } from "@/domain/syncPlan";
-import type { Project, Step, Template } from "@/domain/types";
+import type { Choice, Flow, FlowEdge, Position, Project, Step, Template, ValueSnapshot } from "@/domain/types";
 import type { Repo, StepInput, StoredStep } from "@/server/repo/types";
 import { appendHistory, AppError, EV, newId, summaryFor, type Ctx } from "./context";
+import { hasChoices } from "./definitions";
 import {
   BATCH_SIZE,
   finishJob,
@@ -29,7 +34,7 @@ import {
   type JobStepResult,
 } from "./jobs";
 import { getTemplate } from "./library";
-import { attachmentCounts, buildCells, currentMirror, progressOfCells, stepMirrorsOf, stepState } from "./mirrors";
+import { attachmentCounts, buildCells, currentMirror, progressOfCells, stepMirrorsOf, stepState, valueSnapshot } from "./mirrors";
 import { requireProject, settleAll, stepKeyOf } from "./projects";
 
 export interface SyncPreviewItem extends SyncItem {
@@ -99,6 +104,101 @@ export interface SyncJob extends JobBase<"sync"> {
   /** Unticked items: '<kind>:<key>' -> change hash, merged into Project.syncDismissed at the end. */
   unselected: Record<string, string>;
   templateRevision: number;
+  /** Steps whose patch is already written (besides lastOp === opId). */
+  patchedStepIds?: string[];
+  /** Rev of each patched step when the plan was made: a step changed since then gets a re-based patch. */
+  baseRevs?: Record<string, number>;
+  /** Hash of the project flow the plan was made from, and what the plan changes in it. */
+  baseFlowHash?: string;
+  flowDelta?: FlowDelta;
+  /** Steps the ticked items change (History relates the row to them), with their value snapshot before the sync. */
+  itemStepIds?: string[];
+  before?: Record<string, ValueSnapshot>;
+}
+
+/** What a sync changes in the project flow: nodes it adds, and arrows it adds or changes (by id). */
+export interface FlowDelta {
+  nodes: Record<string, Position>;
+  edges: { before?: FlowEdge; after: FlowEdge }[];
+}
+
+export function flowHash(flow: Flow): string {
+  return createHash("sha256").update(stableStringify(flow ?? { nodes: {}, edges: [] })).digest("hex");
+}
+
+export function flowDeltaOf(base: Flow, planned: Flow): FlowDelta {
+  const nodes: Record<string, Position> = {};
+  for (const [id, p] of Object.entries(planned.nodes)) if (!base.nodes[id]) nodes[id] = { x: p.x, y: p.y };
+  const baseById = new Map(base.edges.map((e) => [e.id, e]));
+  const edges: FlowDelta["edges"] = [];
+  for (const e of planned.edges) {
+    const b = baseById.get(e.id);
+    if (!b) edges.push({ after: e });
+    else if (stableStringify(b) !== stableStringify(e)) edges.push({ before: b, after: e });
+  }
+  return { nodes, edges };
+}
+
+/**
+ * Applies a sync's flow changes onto the project flow as it is now (the user may have moved nodes or drawn and
+ * removed arrows while the job ran). An arrow the user changed meanwhile is left as the user made it; additions and
+ * restores are re-checked for duplicates and loops. Applying the delta twice changes nothing.
+ */
+export function applyFlowDelta(current: Flow, delta: FlowDelta, idMap: Record<string, string>): Flow {
+  const map = (id: string) => (Object.prototype.hasOwnProperty.call(idMap, id) ? idMap[id] : id);
+  const remap = (e: FlowEdge): FlowEdge => ({ ...e, from: map(e.from), to: map(e.to) });
+  const nodes: Record<string, Position> = { ...current.nodes };
+  for (const [id, p] of Object.entries(delta.nodes)) if (!nodes[map(id)]) nodes[map(id)] = { x: p.x, y: p.y };
+  let edges: FlowEdge[] = [...current.edges];
+  const changes = delta.edges.map((d) => ({ before: d.before ? remap(d.before) : undefined, after: remap(d.after) }));
+  // Removals first, so an addition that depends on them is not refused as a loop (same order as applySync).
+  const ordered = [...changes.filter((c) => !isActiveEdge(c.after)), ...changes.filter((c) => isActiveEdge(c.after))];
+  for (const { before, after } of ordered) {
+    const i = edges.findIndex((e) => e.id === after.id);
+    const cur = i >= 0 ? edges[i] : undefined;
+    if (cur && stableStringify(cur) === stableStringify(after)) continue; // already applied
+    if (before ? !cur || stableStringify(cur) !== stableStringify(before) : !!cur) continue; // changed by the user meanwhile
+    const activates = isActiveEdge(after) && (!cur || !isActiveEdge(cur));
+    if (activates) {
+      if (!(after.from in nodes) || !(after.to in nodes)) continue;
+      const others = edges.filter((e) => e !== cur);
+      if (findActivePair(others, after.from, after.to) || wouldCreateCycle(others, after.from, after.to)) continue;
+    }
+    edges = cur ? edges.map((e) => (e === cur ? after : e)) : [...edges, after];
+  }
+  return { nodes, edges };
+}
+
+/** The current choices the planned list doesn't know (added by a newer sync) are kept as they are. */
+function keepAllChoices(planned: Choice[], current: Choice[]): Choice[] {
+  const ids = new Set(planned.map((c) => c.id));
+  return [...planned, ...(current ?? []).filter((c) => !ids.has(c.id))];
+}
+
+/**
+ * A planned patch re-based on a step that changed after the plan was made: the planned value is dropped (values are
+ * never overwritten), a type change converts the current value losslessly or waits (the step keeps its type), and no
+ * current choice is removed.
+ */
+export function rebasePatch(s: Step, planned: Partial<Step>): Partial<Step> {
+  const out: Partial<Step> = { ...planned };
+  delete out.value;
+  if (out.choices) out.choices = keepAllChoices(out.choices, s.choices ?? []);
+  const to = out.fieldType;
+  if (to !== undefined && to !== s.fieldType) {
+    const choices = out.choices ?? s.choices ?? [];
+    const conv = convertValue(s.fieldType, to, s.value ?? null, hasChoices(to) ? choices : undefined);
+    if (conv.ok) {
+      if (stableStringify(conv.value) !== stableStringify(s.value ?? null)) out.value = conv.value;
+    } else {
+      delete out.fieldType;
+    }
+  }
+  return out;
+}
+
+function snapshotChanged(a: ValueSnapshot | undefined, b: ValueSnapshot): boolean {
+  return !a || a.state !== b.state || a.display !== b.display || stableStringify(a.raw) !== stableStringify(b.raw);
 }
 
 export interface StartSyncInput {
@@ -128,20 +228,38 @@ export async function startSync(ctx: Ctx, input: StartSyncInput): Promise<{ tota
     });
   }
   const unselected: Record<string, string> = {};
+  const chosen = new Set(selected);
+  const items = planSync(template, syncInput, ctx.day).items;
   if (input.dismissUnselected !== false) {
-    const chosen = new Set(selected);
-    for (const item of planSync(template, syncInput, ctx.day).items) {
+    for (const item of items) {
       if (item.selectable && !chosen.has(item.id)) unselected[dismissKeyOf(item.id)] = changeHashOf(item.id);
     }
   }
   const result = applied.result;
   const total = result.newSteps.length + result.stepPatches.length + 1;
+  const stepById = new Map(steps.map((s) => [s.id, s]));
+  const baseRevs: Record<string, number> = {};
+  for (const p of result.stepPatches) {
+    const s = stepById.get(p.stepId);
+    if (s) baseRevs[s.id] = s.rev;
+  }
+  const itemStepIds = [...new Set(items.filter((i) => chosen.has(i.id) && i.stepId).map((i) => i.stepId as string))];
+  const before: Record<string, ValueSnapshot> = {};
+  for (const id of itemStepIds) {
+    const s = stepById.get(id);
+    if (s) before[id] = valueSnapshot(s, s.value, counts[id] ?? 0, ctx.day);
+  }
   const job: SyncJob = {
     ...newJob(ctx, "sync", total),
     projectId: project.id,
     result,
     unselected,
     templateRevision: template.revision,
+    baseRevs,
+    baseFlowHash: flowHash(project.flow),
+    flowDelta: flowDeltaOf(project.flow, result.flow),
+    itemStepIds,
+    before,
   };
   await saveJob(ctx.repo, job);
   return { total };
@@ -196,9 +314,11 @@ export async function continueSync(ctx: Ctx, opId: string): Promise<SyncProgress
     byId.set(s.id, s);
   }
   budget -= createBatch.length;
+  const applied = new Set(job.patchedStepIds ?? []);
+  const isPatched = (stepId: string) => applied.has(stepId) || byId.get(stepId)?.lastOp === job.opId;
   const doneSoFar = () =>
     result.newSteps.filter((d) => byKey.has(stepKeyOf(projectId, d.tempId))).length +
-    result.stepPatches.filter((p) => byId.get(p.stepId)?.lastOp === job.opId).length;
+    result.stepPatches.filter((p) => isPatched(p.stepId)).length;
   if (toCreate.length > createBatch.length) {
     return { ...stepResult(false, doneSoFar(), total, `Adding milestones (${doneSoFar()} of ${total})`), projectId };
   }
@@ -206,16 +326,18 @@ export async function continueSync(ctx: Ctx, opId: string): Promise<SyncProgress
   // 2. Step patches.
   const attachments = await ctx.repo.attachments.listByProject(projectId);
   const counts = attachmentCounts(attachments);
-  const pending = result.stepPatches.filter((p) => {
-    const s = byId.get(p.stepId);
-    return s && s.lastOp !== job.opId;
-  });
+  const pending = result.stepPatches.filter((p) => byId.has(p.stepId) && !isPatched(p.stepId));
   const patchBatch = pending.slice(0, budget);
   const patched = await settleAll(
     patchBatch.map((p) => () => {
       const s = byId.get(p.stepId)!;
-      const patch: Partial<StepInput> = { ...(p.patch as Partial<StepInput>), rev: s.rev + 1, lastOp: job.opId };
+      const base = job.baseRevs?.[s.id];
+      // The step changed after the plan (a value entered, another sync): never write the planned value over it.
+      const changedSince = base !== undefined && s.rev !== base;
+      const planned = changedSince ? rebasePatch(s, p.patch) : p.patch;
       const count = counts[s.id] ?? 0;
+      if (changedSince && job.before && s.id in job.before) job.before[s.id] = valueSnapshot(s, s.value, count, ctx.day);
+      const patch: Partial<StepInput> = { ...(planned as Partial<StepInput>), rev: s.rev + 1, lastOp: job.opId };
       if (stepState(s, count, ctx.day).state !== stepState({ ...s, ...patch } as Step, count, ctx.day).state) {
         patch.stateChangedAt = ctx.now;
       }
@@ -223,7 +345,18 @@ export async function continueSync(ctx: Ctx, opId: string): Promise<SyncProgress
       return ctx.repo.steps.update(s.id, patch);
     }),
   );
-  for (const s of patched) byId.set(s.id, s);
+  for (const s of patched) {
+    byId.set(s.id, s);
+    applied.add(s.id);
+  }
+  if (patched.length > 0) {
+    // Remember what was patched, so a later user edit of such a step (new lastOp) never gets the patch again,
+    // also when the finalize below is interrupted and resumed.
+    job.patchedStepIds = [...applied];
+    job.doneCount = doneSoFar();
+    job.updatedAt = ctx.now;
+    await saveJob(ctx.repo, job);
+  }
   if (pending.length > patchBatch.length) {
     return { ...stepResult(false, doneSoFar(), total, `Updating milestones (${doneSoFar()} of ${total})`), projectId };
   }
@@ -235,7 +368,12 @@ export async function continueSync(ctx: Ctx, opId: string): Promise<SyncProgress
     const s = byKey.get(stepKeyOf(projectId, d.tempId));
     if (s) idMap[d.tempId] = s.id;
   }
-  const flow = remapFlow(result.flow, idMap);
+  // The planned flow as is when the project flow is still the one the plan was made from; otherwise only the plan's
+  // changes, applied onto the flow as it is now (positions moved and arrows drawn meanwhile are kept).
+  const flow =
+    !job.flowDelta || !job.baseFlowHash || flowHash(project.flow) === job.baseFlowHash
+      ? remapFlow(result.flow, idMap)
+      : applyFlowDelta(project.flow, job.flowDelta, idMap);
   const steps: StoredStep[] = [...byId.values()];
   const cells = buildCells(steps, counts);
   const progress = progressOfCells(cells, ctx.day).pct;
@@ -254,6 +392,16 @@ export async function continueSync(ctx: Ctx, opId: string): Promise<SyncProgress
   const n = result.appliedItemIds.length;
   const declined = Object.keys(job.unselected);
   if (n > 0 || declined.length > 0) {
+    // One row for the whole sync; it relates to every step an applied item changed or added (each step's history
+    // shows it), with old/new snapshots for the steps whose value, display or colour changed.
+    const addedStepIds = Object.values(idMap);
+    const itemStepIds = (job.itemStepIds ?? []).filter((id) => byId.has(id));
+    const detail = itemStepIds.flatMap((id) => {
+      const s = byId.get(id)!;
+      const neu = valueSnapshot(s, s.value, counts[id] ?? 0, ctx.day);
+      const old = job.before?.[id];
+      return snapshotChanged(old, neu) ? [{ stepId: id, stepName: s.name, milestoneKey: s.milestoneKey, old, new: neu }] : [];
+    });
     await appendHistory(
       ctx,
       {
@@ -266,7 +414,9 @@ export async function continueSync(ctx: Ctx, opId: string): Promise<SyncProgress
           appliedItemIds: result.appliedItemIds,
           declinedItemKeys: declined,
           templateRevision: job.templateRevision,
-          addedStepIds: Object.values(idMap),
+          addedStepIds,
+          stepIds: [...new Set([...itemStepIds, ...addedStepIds])],
+          steps: detail,
         },
       },
       { opId: job.opId },

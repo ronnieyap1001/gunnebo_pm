@@ -73,10 +73,10 @@ describe("rate limits and retries", () => {
     expect((err as NotionError).code).toBe("conflict_error");
   });
 
-  it("a 503 after commit surfaces as NotionUnavailableError while the row exists (callers must re-read)", async () => {
+  it("a 503 after commit (without the committed id) surfaces as NotionUnavailableError while the row exists (callers must re-read)", async () => {
     const { fake, repo } = await gatedSetup();
     const before = fake.fake.pageCount();
-    fake.fake.injectFault({ status: 503, afterCommit: true, method: "pages.create" });
+    fake.fake.injectFault({ status: 503, afterCommit: true, method: "pages.create", reportCommittedId: false });
     const err = await repo.settings.set("c", 1).catch((e: unknown) => e);
     expect(err).toBeInstanceOf(NotionUnavailableError);
     expect((err as NotionUnavailableError).mayHaveCommitted).toBe(true);

@@ -415,6 +415,8 @@ export async function reorderMilestone(
  * Archives a milestone and its template node: every arrow touching it is archived with the batch id and, with
  * `reconnect` (default), each predecessor is bridged to each successor (bridges are recorded in the batch so Undo
  * removes them). Revision + 1. History `milestone.archived`.
+ * The batch id is the action's opId, so a retry of an interrupted archive recognises its own batch and finishes the
+ * arrows, the revision and the History row.
  */
 export async function archiveMilestone(
   ctx: Ctx,
@@ -424,18 +426,20 @@ export async function archiveMilestone(
   const template = await getTemplate(ctx.repo);
   const m = template.milestones.find((x) => x.id === id);
   if (!m) throw notFound("This milestone");
-  if (m.archived) return { batchId: m.archiveBatch ?? "", archivedEdgeIds: [], bridgeEdgeIds: [] };
+  const batchId = ctx.opId;
+  if (m.archived && m.archiveBatch !== batchId) return { batchId: m.archiveBatch ?? "", archivedEdgeIds: [], bridgeEdgeIds: [] };
 
-  const batchId = newId();
   const result = archiveNodeInFlow(template.flow, id, {
     batchId,
     now: ctx.now,
     reconnect: opts.reconnect !== false,
     idFactory: edgeIdFactory(),
   });
-  await ctx.repo.milestones.update(id, { archived: true, archivedAt: ctx.now, archiveBatch: batchId });
-  await saveTemplateFlow(ctx, result.flow);
-  const revision = await bumpTemplateRevision(ctx);
+  if (!m.archived) await ctx.repo.milestones.update(id, { archived: true, archivedAt: ctx.now, archiveBatch: batchId });
+  if (result.archivedEdgeIds.length > 0 || result.bridgeEdgeIds.length > 0) await saveTemplateFlow(ctx, result.flow);
+  const revision = (await alreadyLogged(ctx)) ? await readTemplateRevision(ctx.repo) : await bumpTemplateRevision(ctx);
+  const archivedEdgeIds = result.flow.edges.filter((e) => e.archivedAt && e.batchId === batchId).map((e) => e.id);
+  const bridgeEdgeIds = result.flow.edges.filter((e) => e.createdByBatchId === batchId).map((e) => e.id);
   await appendHistory(ctx, {
     type: EV.milestoneArchived,
     summary: lib(`Archived "${m.name}"`),
@@ -445,17 +449,19 @@ export async function archiveMilestone(
       milestoneKey: m.key,
       batchId,
       reconnect: opts.reconnect !== false,
-      archivedEdgeIds: result.archivedEdgeIds,
-      bridgeEdgeIds: result.bridgeEdgeIds,
+      archivedEdgeIds,
+      bridgeEdgeIds,
       revision,
     },
   });
-  return { batchId, archivedEdgeIds: result.archivedEdgeIds, bridgeEdgeIds: result.bridgeEdgeIds };
+  return { batchId, archivedEdgeIds, bridgeEdgeIds };
 }
 
 /**
  * Undo an archive: un-archives the batch's milestones, removes the bridges the batch created and restores the
  * batch's arrows whose two ends are active and that don't create a loop. Revision + 1.
+ * Write order: template flow → revision → History → milestones, so a retry after a crash at any point finishes the
+ * job (restoreBatchInFlow is a no-op on a flow already restored; the revision and History are written once per opId).
  */
 export async function restoreBatch(
   ctx: Ctx,
@@ -469,12 +475,10 @@ export async function restoreBatch(
   const activeIds = new Set(template.milestones.filter((m) => !m.archived).map((m) => m.id));
   for (const m of batch) activeIds.add(m.id);
   const result = restoreBatchInFlow(template.flow, batchId, activeIds, ctx.now);
-
-  for (const m of batch) {
-    await ctx.repo.milestones.update(m.id, { archived: false, archivedAt: undefined, archiveBatch: undefined });
-  }
-  await saveTemplateFlow(ctx, ensureNodes(result.flow, batch.map((m) => m.id)));
-  const revision = await bumpTemplateRevision(ctx);
+  const flow = ensureNodes(result.flow, batch.map((m) => m.id));
+  if (stableStringify(flow) !== stableStringify(template.flow)) await saveTemplateFlow(ctx, flow);
+  const logged = await alreadyLogged(ctx);
+  const revision = logged ? await readTemplateRevision(ctx.repo) : await bumpTemplateRevision(ctx);
   const names = batch.map((m) => `"${m.name}"`).join(", ");
   await appendHistory(ctx, {
     type: EV.milestoneRestored,
@@ -492,6 +496,9 @@ export async function restoreBatch(
       revision,
     },
   });
+  for (const m of batch) {
+    await ctx.repo.milestones.update(m.id, { archived: false, archivedAt: undefined, archiveBatch: undefined });
+  }
   return { restoredIds: batch.map((m) => m.id), restoredEdgeIds: result.restoredEdgeIds, skippedEdgeIds: result.skippedEdgeIds };
 }
 
@@ -503,10 +510,11 @@ export async function restoreMilestone(ctx: Ctx, id: string): Promise<{ restored
     const r = await restoreBatch(ctx, m.archiveBatch);
     return { restoredIds: r.restoredIds, skippedEdgeIds: r.skippedEdgeIds };
   }
+  // Same write order as restoreBatch: flow → revision → History → milestone (a retry finishes an interrupted restore).
   const flow = await readTemplateFlow(ctx.repo);
-  await ctx.repo.milestones.update(id, { archived: false, archivedAt: undefined, archiveBatch: undefined });
-  await saveTemplateFlow(ctx, ensureNodes(flow, [id]));
-  const revision = await bumpTemplateRevision(ctx);
+  const placed = ensureNodes(flow, [id]);
+  if (placed !== flow) await saveTemplateFlow(ctx, placed);
+  const revision = (await alreadyLogged(ctx)) ? await readTemplateRevision(ctx.repo) : await bumpTemplateRevision(ctx);
   await appendHistory(ctx, {
     type: EV.milestoneRestored,
     summary: lib(`Restored "${m.name}"`),
@@ -514,6 +522,7 @@ export async function restoreMilestone(ctx: Ctx, id: string): Promise<{ restored
     milestoneKey: m.key,
     data: { milestoneKey: m.key, milestoneIds: [id], revision },
   });
+  await ctx.repo.milestones.update(id, { archived: false, archivedAt: undefined, archiveBatch: undefined });
   return { restoredIds: [id], skippedEdgeIds: [] };
 }
 

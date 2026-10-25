@@ -21,15 +21,22 @@ export type * from "./types";
  *   setRegistryLoader(unstable_cache(() => discoverRegistry(getNotion()), ['schema', String(SCHEMA_VERSION)],
  *     { tags: ['schema'], revalidate: 3600 }));
  *
- * and call revalidateTag('schema') / updateTag('schema') after Setup steps and on "Reload from Notion".
+ * and pass an `onReset` that revalidates the 'schema' tag (it runs after Setup steps, on "Reload from Notion" and
+ * when the repo finds a stale id).
  */
 
-type Holder = { repo?: Repo; admin?: StorageAdmin; handle?: RegistryHandle; loader?: () => Promise<Registry> };
+type Holder = {
+  repo?: Repo;
+  admin?: StorageAdmin;
+  handle?: RegistryHandle;
+  loader?: () => Promise<Registry>;
+  onReset?: () => void;
+};
 const KEY = Symbol.for("gunnebo-pm.repo");
 const holder = ((globalThis as { [KEY]?: Holder })[KEY] ??= {});
 
 function registryHandle(): RegistryHandle {
-  holder.handle ??= createRegistryHandle(getNotion(), { loader: holder.loader });
+  holder.handle ??= createRegistryHandle(getNotion(), { loader: holder.loader, onReset: holder.onReset });
   return holder.handle;
 }
 
@@ -47,9 +54,15 @@ export function getStorageAdmin(): StorageAdmin {
   return holder.admin;
 }
 
-/** Plug in a shared registry cache (e.g. unstable_cache around discoverRegistry). Call once at startup. */
-export function setRegistryLoader(loader: (() => Promise<Registry>) | undefined): void {
+/**
+ * Plug in a shared registry cache (e.g. unstable_cache around discoverRegistry). Call once at startup.
+ * `onReset` runs whenever the registry is dropped (a stale id seen by the repo, Setup steps, "Reload from Notion"),
+ * e.g. `() => revalidateTag('schema', { expire: 0 })`, so other instances stop using the stale shared copy. It must
+ * not throw (wrap calls that are only allowed in some contexts).
+ */
+export function setRegistryLoader(loader: (() => Promise<Registry>) | undefined, onReset?: () => void): void {
   holder.loader = loader;
+  holder.onReset = onReset;
   holder.handle = undefined;
 }
 

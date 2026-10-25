@@ -10,6 +10,7 @@ import {
   restoreProject,
   startCreateProject,
   updateProject,
+  type CreateProjectJob,
 } from "@/server/services/projects";
 import { listProjectFields } from "@/server/services/projectFields";
 import { loadJob } from "@/server/services/jobs";
@@ -123,7 +124,7 @@ describe("template -> project copy", () => {
     };
     await expect(startCreateProject(w.ctx({ opId }), { code: "C0901", name: "X" })).rejects.toThrow("timeout");
     w.repo.beforeWrite = null;
-    const job = await loadJob<{ projectId?: string; kind: string }>(w.repo, opId);
+    const job = await loadJob<CreateProjectJob>(w.repo, opId);
     expect(job?.projectId).toBeUndefined();
     for (let i = 0; i < 20; i++) if ((await continueCreateProject(w.ctx(), opId)).done) break;
     const projects = await w.repo.projects.list();
@@ -134,7 +135,7 @@ describe("template -> project copy", () => {
   it("finished job leaves a tombstone without the drafts", async () => {
     const opId = randomUUID();
     await createProject(w, {}, opId);
-    const job = await loadJob<Record<string, unknown>>(w.repo, opId);
+    const job = await loadJob<CreateProjectJob>(w.repo, opId);
     expect(job).toMatchObject({ status: "done", kind: "createProject" });
     expect(job).not.toHaveProperty("drafts");
   });

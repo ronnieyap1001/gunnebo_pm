@@ -151,6 +151,8 @@ export interface CreateProjectJob extends JobBase<"createProject"> {
   name: string;
   drafts: StepDraft[];
   revision: number;
+  /** The Project row to create, so a retry after a crash before the row existed can still create it. */
+  row?: ProjectInput;
 }
 
 export function stepKeyOf(projectId: string, tempId: string): string {
@@ -182,15 +184,6 @@ export async function startCreateProject(ctx: Ctx, input: CreateProjectInput): P
   }
   const snapshot = buildProjectSnapshot(template, ctx.now);
 
-  const job: CreateProjectJob = {
-    ...newJob(ctx, "createProject", snapshot.steps.length),
-    code,
-    name,
-    drafts: snapshot.steps,
-    revision: template.revision,
-  };
-  await saveJob(ctx.repo, job);
-
   const row: ProjectInput = {
     code,
     name,
@@ -205,22 +198,42 @@ export async function startCreateProject(ctx: Ctx, input: CreateProjectInput): P
     setup: "CREATING",
     archived: false,
   };
+  const job: CreateProjectJob = {
+    ...newJob(ctx, "createProject", snapshot.steps.length),
+    code,
+    name,
+    drafts: snapshot.steps,
+    revision: template.revision,
+    row,
+  };
+  await saveJob(ctx.repo, job);
+
   const project = await ctx.repo.projects.create(row);
   job.projectId = project.id;
+  delete job.row;
   await saveJob(ctx.repo, job);
   return { projectId: project.id, total: job.total };
 }
 
-/** Resume after a crash between saving the job and recording the project id: find our row by code. */
+/**
+ * Resume after a crash between saving the job and recording the project id: find our row by code (it may have been
+ * created), or create it from the job when the first attempt never got that far.
+ */
 async function adoptOrCreateProject(ctx: Ctx, job: CreateProjectJob): Promise<Project> {
   const found = await ctx.repo.projects.findByCode(job.code);
   if (found && found.setup === "CREATING") {
     job.projectId = found.id;
+    delete job.row;
     await saveJob(ctx.repo, job);
     return found;
   }
   if (found) throw new AppError("CODE_TAKEN", `${job.code} is already used by "${found.name}".`);
-  throw new AppError("NOT_FOUND", "This project was not created. Start again.");
+  if (!job.row) throw new AppError("NOT_FOUND", "This project was not created. Start again.");
+  const project = await ctx.repo.projects.create(job.row);
+  job.projectId = project.id;
+  delete job.row;
+  await saveJob(ctx.repo, job);
+  return project;
 }
 
 export interface CreateProgress extends JobStepResult {
@@ -274,7 +287,9 @@ export async function continueCreateProject(ctx: Ctx, opId: string): Promise<Cre
   const flow = remapFlow(fresh.flow, idMap);
   const cells = buildCells(steps, {});
   const progress = progressOfCells(cells, ctx.day).pct;
-  if (fresh.setup !== "READY" || !cellsEqual(cells, fresh.cells)) {
+  // READY is written together with the remapped flow and the cells, so a READY project was finalized already (a
+  // resumed call only completes the History row and the job). Rewriting it would drop changes made since.
+  if (fresh.setup !== "READY") {
     await ctx.repo.projects.update(projectId, {
       flow,
       cells,

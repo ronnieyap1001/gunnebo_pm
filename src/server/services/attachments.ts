@@ -13,7 +13,7 @@ import { attachmentCounts, stepState, writeMirrors, type CellsProgress } from ".
 import { requireProject } from "./projects";
 
 /** Vercel's request cap is 4.5 MB and Notion Free's file limit 5 MiB. */
-export const MAX_FILE_BYTES = 4 * 1024 * 1024;
+export const MAX_FILE_BYTES = 4_000_000;
 
 export interface AttachmentWriteResult {
   attachment: Attachment;

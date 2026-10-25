@@ -29,6 +29,7 @@ export function splitText(s: string, max = RICH_TEXT_ITEM_MAX): string[] {
 
 /** Cuts `s` to at most `max` UTF-16 units without splitting a surrogate pair; adds '…' when cut. */
 export function truncateText(s: string, max: number): string {
+  if (max <= 0) return "";
   if (s.length <= max) return s;
   let end = max - 1;
   if (end > 0 && isHighSurrogate(s.charCodeAt(end - 1))) end -= 1;

@@ -4,7 +4,8 @@ import { APIErrorCode, APIResponseError, RequestTimeoutError, UnknownHTTPRespons
 /**
  * Plain-English errors for everything that can go wrong between the app and Notion.
  * Messages are safe to show to the user: they never contain request bodies or tokens.
- * The raw Notion message (useful in logs) is kept in `detail`.
+ * Notion's own message (useful in logs, with quoted request values removed) is kept in `detail`; the raw SDK
+ * error is not attached as `cause`, because its message and body may quote what was sent.
  */
 export class NotionError extends Error {
   readonly code: string;
@@ -12,10 +13,12 @@ export class NotionError extends Error {
   /** Raw Notion error message or extra context, for logs only. */
   readonly detail?: string;
   readonly requestId?: string;
+  /** The raw Notion API error code (e.g. 'object_not_found') when this came from a Notion response. */
+  readonly notionCode?: string;
 
   constructor(
     message: string,
-    opts: { code?: string; status?: number; detail?: string; requestId?: string; cause?: unknown } = {},
+    opts: { code?: string; status?: number; detail?: string; requestId?: string; notionCode?: string; cause?: unknown } = {},
   ) {
     super(message, opts.cause === undefined ? undefined : { cause: opts.cause });
     this.name = new.target.name;
@@ -23,6 +26,7 @@ export class NotionError extends Error {
     this.status = opts.status;
     this.detail = opts.detail;
     this.requestId = opts.requestId;
+    this.notionCode = opts.notionCode;
   }
 }
 
@@ -116,9 +120,21 @@ function formatMb(bytes: number): string {
 // Mapping
 // ---------------------------------------------------------------------------
 
-/** The raw Notion API error code of `e`, if it is one (e.g. 'object_not_found'). */
+/**
+ * Notion's validation messages can quote what was sent ("…instead was `"Acme, Inc."`."). Drops the quoted values
+ * so neither logs nor `detail` carry request contents.
+ */
+export function scrubNotionMessage(message: string): string {
+  return message
+    .replace(/(instead was|got|received|value)\s*`[^`]*`/gi, "$1 `…`")
+    .replace(/(instead was|got|received)\s*"(?:[^"\\]|\\.)*"/gi, '$1 "…"')
+    .slice(0, 500);
+}
+
+/** The raw Notion API error code of `e` (an SDK error or one mapped by mapNotionError), e.g. 'object_not_found'. */
 export function notionErrorCode(e: unknown): string | undefined {
   if (APIResponseError.isAPIResponseError(e)) return e.code;
+  if (e instanceof NotionError) return e.notionCode;
   return undefined;
 }
 
@@ -163,7 +179,8 @@ function retryAfterMs(headers: unknown): number | undefined {
 export function mapNotionError(e: unknown): unknown {
   if (e instanceof NotionError) return e;
   if (APIResponseError.isAPIResponseError(e)) {
-    const base = { status: e.status, detail: e.message, requestId: e.request_id, cause: e };
+    // `cause` is left out on purpose: the raw error's message and body may quote submitted values.
+    const base = { status: e.status, detail: scrubNotionMessage(e.message), requestId: e.request_id, notionCode: e.code };
     const data = additionalData(e);
     switch (e.code) {
       case APIErrorCode.Unauthorized:
@@ -201,7 +218,8 @@ export function mapNotionError(e: unknown): unknown {
     return new NotionUnavailableError({ detail: e.message, cause: e });
   }
   if (UnknownHTTPResponseError.isUnknownHTTPResponseError(e)) {
-    const base = { status: e.status, detail: e.message, cause: e };
+    // No `cause`: the raw error carries the response body.
+    const base = { status: e.status, detail: scrubNotionMessage(e.message) };
     if (e.status === 429) return new NotionBusyError({ ...base, retryAfterMs: retryAfterMs(e.headers) });
     if (e.status === 413) return new ValueTooLargeError("This change is too large to send to Notion in one go.", base);
     if (e.status >= 500) return new NotionUnavailableError(base);

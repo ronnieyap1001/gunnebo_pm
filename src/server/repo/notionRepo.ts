@@ -22,6 +22,7 @@ import {
   FileTooLargeError,
   NotSharedError,
   NotionError,
+  NotionUnavailableError,
   SetupIncompleteError,
   ValueTooLargeError,
   isNotionCode,
@@ -30,7 +31,6 @@ import {
 import {
   findSettingRow,
   propById,
-  upsertSettingRow,
   type DbEntry,
   type Registry,
   type RegistryHandle,
@@ -122,6 +122,47 @@ function sizeOf(x: unknown): number {
   return Buffer.byteLength(JSON.stringify(x), "utf8");
 }
 
+// JSON properties can be hand-edited in Notion: valid JSON of the wrong shape must not reach the app either.
+type Norm<T> = (v: unknown) => T | undefined;
+
+function isObj(v: unknown): v is Record<string, unknown> {
+  return typeof v === "object" && v !== null && !Array.isArray(v);
+}
+function asObject<T>(v: unknown): T | undefined {
+  return isObj(v) ? (v as T) : undefined;
+}
+const asChoices: Norm<Choice[]> = (v) =>
+  Array.isArray(v) ? (v.filter((c) => isObj(c) && typeof c.id === "string" && typeof c.label === "string") as Choice[]) : undefined;
+const asFlow: Norm<Flow> = (v) => {
+  if (!isObj(v)) return undefined;
+  const nodes = isObj(v.nodes)
+    ? Object.fromEntries(Object.entries(v.nodes).filter(([, p]) => isObj(p) && typeof p.x === "number" && typeof p.y === "number"))
+    : {};
+  const edges = Array.isArray(v.edges)
+    ? v.edges.filter((x) => isObj(x) && typeof x.id === "string" && typeof x.from === "string" && typeof x.to === "string")
+    : [];
+  return { nodes, edges } as Flow;
+};
+const asCells: Norm<Project["cells"]> = (v) =>
+  isObj(v) ? (Object.fromEntries(Object.entries(v).filter(([, c]) => isObj(c) && typeof c.t === "string")) as Project["cells"]) : undefined;
+const asValue: Norm<Value | null> = (v) => (v === null || isObj(v) ? (v as Value | null) : undefined);
+
+/** Absolute http(s) URL (links can be retyped in Notion; `javascript:` and friends never reach the app). */
+function isHttpUrl(u: string | null | undefined): u is string {
+  if (!u || /\s/.test(u) || u.length > 2000) return false;
+  try {
+    const url = new URL(u);
+    return (url.protocol === "http:" || url.protocol === "https:") && url.hostname.length > 0;
+  } catch {
+    return false;
+  }
+}
+
+const YMD_RE = /^\d{4}-\d{2}-\d{2}$/;
+function ymd(s: unknown): string | undefined {
+  return typeof s === "string" && YMD_RE.test(s) && !Number.isNaN(Date.parse(s)) ? s : undefined;
+}
+
 
 // ---------------------------------------------------------------------------
 // Reading pages (by property id)
@@ -152,10 +193,15 @@ class Row {
   optText(pk: string): string | undefined {
     return this.text(pk) || undefined;
   }
-  json<T>(pk: string, fallback: T): T {
+  /** Parsed JSON; `fallback` when empty, unparseable or (with `norm`) of the wrong shape. */
+  json<T>(pk: string, fallback: T, norm?: Norm<T>): T {
     const v = this.v(pk);
     if (!v || v.type !== "rich_text") return fallback;
-    return richTextToJson<T>(v.rich_text, fallback);
+    const raw = richTextToJson<unknown>(v.rich_text, undefined);
+    if (raw === undefined) return fallback;
+    if (!norm) return raw as T;
+    const n = norm(raw);
+    return n === undefined ? fallback : n;
   }
   num(pk: string): number | null {
     const v = this.v(pk);
@@ -181,10 +227,12 @@ class Row {
     const v = this.v(pk);
     return v && v.type === "url" ? v.url : null;
   }
-  files(pk: string): { name: string; url: string }[] {
+  files(pk: string): { name: string; url: string; external: boolean }[] {
     const v = this.v(pk);
     if (!v || v.type !== "files") return [];
-    return v.files.map((f) => ({ name: f.name, url: f.type === "file" ? f.file.url : f.external.url }));
+    return v.files.map((f) =>
+      f.type === "file" ? { name: f.name, url: f.file.url, external: false } : { name: f.name, url: f.external.url, external: true },
+    );
   }
   get id(): string {
     return this.page.id;
@@ -297,13 +345,19 @@ export function simpleDisplay(v: Value | null | undefined, choices?: Choice[]): 
   return "";
 }
 
+/** The Date mirror. Only well-formed calendar dates are mirrored: a mirror must never make the real write fail. */
 function dateMirror(v: Value | null | undefined): { start: string; end?: string | null } | null {
   if (!v) return null;
-  if ("date" in v) return { start: v.date };
+  if ("date" in v) {
+    const d = ymd(v.date);
+    return d ? { start: d } : null;
+  }
   if ("start" in v || "end" in v) {
-    const start = v.start ?? v.end;
+    const s = ymd(v.start);
+    const e = ymd(v.end);
+    const start = s ?? e;
     if (!start) return null;
-    return { start, end: v.start && v.end ? v.end : null };
+    return { start, end: s && e && e >= s ? e : null };
   }
   return null;
 }
@@ -336,8 +390,31 @@ function relatedStepIds(data: Record<string, unknown> | undefined, main: string 
 // Repository
 // ---------------------------------------------------------------------------
 
-/** Thrown inside a call when a data source id looks stale; the call is retried once after rediscovery. */
-class StaleRegistry extends Error {}
+/**
+ * Thrown inside a call when the cached registry looks stale (a data source id Notion no longer knows, or a property
+ * id Notion says does not exist); the call is retried once after rediscovery.
+ */
+class StaleRegistry extends Error {
+  constructor(
+    readonly kind: "dataSource" | "property",
+    readonly mapped: unknown,
+  ) {
+    super(`stale ${kind}`);
+  }
+}
+
+/**
+ * Notion's messages when a write, filter or sort names a property id the data source no longer has, or whose type
+ * was changed in Notion (the id stays, the type does not match the schema any more).
+ */
+const PROPERTY_GONE_RE = /is not a property that exists|could not find (sort )?property|is expected to be/i;
+
+function rawNotionMessage(e: unknown): string {
+  return e instanceof Error ? e.message : "";
+}
+
+/** Page ids → data source ids remembered per instance (pages never move between the app's databases). */
+const PARENT_CACHE_MAX = 20_000;
 
 function staticHandle(reg: Registry): RegistryHandle {
   return {
@@ -373,6 +450,22 @@ export function createNotionRepo(notion: NotionLike, registry: RegistryHandle | 
     return new Date(lastCreated).toISOString();
   };
 
+  // Which data source each page seen by this instance belongs to (writes are refused for pages of another one).
+  const parentOf = new Map<string, string>();
+  function remember(p: PageObjectResponse): void {
+    if (p.parent.type !== "data_source_id") return;
+    if (parentOf.size >= PARENT_CACHE_MAX) parentOf.clear();
+    parentOf.set(normalizeId(p.id), normalizeId(p.parent.data_source_id));
+  }
+  // Settings key → page id, so a value just written is read back by id (queries may lag behind writes).
+  const settingIds = new Map<string, string>();
+  const settingLocks = new Map<string, Promise<void>>();
+
+  function dropCaches(): void {
+    parentOf.clear();
+    settingIds.clear();
+  }
+
   async function call<T>(fn: (reg: Registry) => Promise<T>): Promise<T> {
     try {
       const reg = await handle.require();
@@ -381,12 +474,14 @@ export function createNotionRepo(notion: NotionLike, registry: RegistryHandle | 
       } catch (e) {
         if (!(e instanceof StaleRegistry)) throw e;
         handle.reset();
+        dropCaches();
         const fresh = await handle.require();
         try {
           return await fn(fresh);
         } catch (e2) {
-          if (e2 instanceof StaleRegistry) throw new NotSharedError((e2.cause as Error | undefined)?.message);
-          throw e2;
+          if (!(e2 instanceof StaleRegistry)) throw e2;
+          // Rediscovery did not explain it (a missing property would have failed `require()` above): report Notion's error.
+          throw e2.mapped instanceof NotionError ? e2.mapped : new NotSharedError();
         }
       }
     } catch (e) {
@@ -400,22 +495,26 @@ export function createNotionRepo(notion: NotionLike, registry: RegistryHandle | 
     return e;
   };
 
-  /** Data-source scoped calls: object_not_found means our cached ids are stale. */
-  async function dsScoped<T>(p: Promise<T>): Promise<T> {
+  /**
+   * Calls scoped to a data source: object_not_found means its cached id is stale. Any call: a validation error
+   * naming a property that does not exist means a cached property id is stale (deleted in Notion).
+   */
+  async function dsScoped<T>(p: Promise<T>, scope: "dataSource" | "page" = "dataSource"): Promise<T> {
     try {
       return await p;
     } catch (e) {
-      if (isNotionCode(e, "object_not_found")) {
-        const s = new StaleRegistry("stale data source");
-        (s as { cause?: unknown }).cause = mapNotionError(e);
-        throw s;
+      if (scope === "dataSource" && isNotionCode(e, "object_not_found")) throw new StaleRegistry("dataSource", mapNotionError(e));
+      if (isNotionCode(e, "validation_error") && PROPERTY_GONE_RE.test(rawNotionMessage(e))) {
+        throw new StaleRegistry("property", mapNotionError(e));
       }
       throw e;
     }
   }
 
   async function query(e: DbEntry, args: Omit<QueryArgs, "data_source_id">) {
-    return dsScoped(notion.dataSources.query({ ...args, data_source_id: e.dataSourceId }));
+    const res = await dsScoped(notion.dataSources.query({ ...args, data_source_id: e.dataSourceId }));
+    for (const r of res.results) if (isFullPage(r)) remember(r);
+    return res;
   }
 
   async function queryAll(e: DbEntry, args: Omit<QueryArgs, "data_source_id" | "page_size" | "start_cursor">): Promise<PageObjectResponse[]> {
@@ -438,7 +537,9 @@ export function createNotionRepo(notion: NotionLike, registry: RegistryHandle | 
     if (!pid) return null;
     try {
       const p = await notion.pages.retrieve({ page_id: pid, filter_properties: filterProps });
-      if (!isFullPage(p) || p.in_trash || !inDataSource(p, e)) return null;
+      if (!isFullPage(p)) return null;
+      remember(p);
+      if (p.in_trash || !inDataSource(p, e)) return null;
       return p;
     } catch (err) {
       if (isNotionCode(err, "object_not_found") || isNotionCode(err, "validation_error")) return null;
@@ -446,15 +547,48 @@ export function createNotionRepo(notion: NotionLike, registry: RegistryHandle | 
     }
   }
 
+  /**
+   * Refuses to write to a page of another database. Every database's title property has the id "title", so an id
+   * from the wrong table (a bug, or a crafted request) would otherwise overwrite e.g. a project's Code. Free for
+   * pages this instance has already read or written; otherwise one light read (title only).
+   */
+  async function assertInDataSource(e: DbEntry, pid: string): Promise<void> {
+    let ds = parentOf.get(pid);
+    if (ds === undefined) {
+      let p: Awaited<ReturnType<NotionLike["pages"]["retrieve"]>>;
+      try {
+        p = await notion.pages.retrieve({ page_id: pid, filter_properties: ["title"] });
+      } catch (err) {
+        if (isNotionCode(err, "object_not_found") || isNotionCode(err, "validation_error")) throw new NotSharedError();
+        throw err;
+      }
+      if (!isFullPage(p)) throw new NotSharedError();
+      remember(p);
+      ds = p.parent.type === "data_source_id" ? normalizeId(p.parent.data_source_id) : "";
+    }
+    if (ds !== normalizeId(e.dataSourceId)) throw new NotSharedError("This item belongs to a different Notion database.");
+  }
+
   async function createPage(e: DbEntry, w: Writes, filterProps?: string[]): Promise<PageObjectResponse> {
     const [first, ...rest] = splitWrites(w.props);
-    const created = await dsScoped(
-      notion.pages.create({
-        parent: { type: "data_source_id", data_source_id: e.dataSourceId },
-        properties: first,
-        filter_properties: rest.length ? undefined : filterProps,
-      }),
-    );
+    let created: Awaited<ReturnType<NotionLike["pages"]["create"]>>;
+    try {
+      created = await dsScoped(
+        notion.pages.create({
+          parent: { type: "data_source_id", data_source_id: e.dataSourceId },
+          properties: first,
+          filter_properties: rest.length ? undefined : filterProps,
+        }),
+      );
+    } catch (err) {
+      // A 5xx after Notion already saved the page: when Notion names the page, carry on with it (no duplicate on retry).
+      const mapped = mapNotionError(err);
+      const id = mapped instanceof NotionUnavailableError ? mapped.committedResourceId : undefined;
+      const saved = id ? await getPage(e, id, rest.length ? undefined : filterProps).catch(() => null) : null;
+      if (!saved) throw err;
+      created = saved;
+    }
+    if (isFullPage(created)) remember(created);
     let page = created;
     for (let i = 0; i < rest.length; i++) {
       page = await notion.pages.update({
@@ -475,18 +609,64 @@ export function createNotionRepo(notion: NotionLike, registry: RegistryHandle | 
       if (!p) throw new NotSharedError();
       return p;
     }
+    await assertInDataSource(e, pid);
     const groups = splitWrites(w.props);
     let page: Awaited<ReturnType<NotionLike["pages"]["update"]>> | undefined;
     for (let i = 0; i < groups.length; i++) {
-      page = await notion.pages.update({
-        page_id: pid,
-        properties: groups[i],
-        filter_properties: i === groups.length - 1 ? filterProps : undefined,
-      });
+      try {
+        page = await dsScoped(
+          notion.pages.update({
+            page_id: pid,
+            properties: groups[i],
+            filter_properties: i === groups.length - 1 ? filterProps : undefined,
+          }),
+          "page",
+        );
+      } catch (err) {
+        if (isNotionCode(err, "validation_error") && /archived|in the trash|in_trash/i.test(rawNotionMessage(err))) {
+          throw new NotSharedError("This item is in Notion's trash. Restore it in Notion (Trash), then reload.", {
+            notionCode: "validation_error",
+          });
+        }
+        throw err;
+      }
     }
     if (!page || !isFullPage(page)) throw new NotionError("Notion returned an incomplete page.");
+    remember(page);
     if (!inDataSource(page, e)) throw new NotSharedError("This item belongs to a different Notion database.");
     return page;
+  }
+
+  /** Runs `fn` after every earlier call for the same settings key in this instance (no duplicate rows from races). */
+  async function serial<T>(key: string, fn: () => Promise<T>): Promise<T> {
+    const prev = settingLocks.get(key) ?? Promise.resolve();
+    const run = prev.then(fn);
+    const tail = run.then(
+      () => undefined,
+      () => undefined,
+    );
+    settingLocks.set(key, tail);
+    try {
+      return await run;
+    } finally {
+      if (settingLocks.get(key) === tail) settingLocks.delete(key);
+    }
+  }
+
+  /** The Settings row for `key`: by the id this instance remembers, else the oldest row whose Key is exactly `key`. */
+  async function settingRow(e: DbEntry, key: string): Promise<PageObjectResponse | null> {
+    const known = settingIds.get(key);
+    if (known) {
+      const p = await getPage(e, known);
+      if (p && new Row(p, e).text("key") === key) return p;
+      settingIds.delete(key);
+    }
+    const row = await dsScoped(findSettingRow(notion, e, key));
+    if (row) {
+      remember(row);
+      settingIds.set(key, row.id);
+    }
+    return row;
   }
 
   function relContains(e: DbEntry, pk: string, id: string): FilterItem {
@@ -535,8 +715,8 @@ export function createNotionRepo(notion: NotionLike, registry: RegistryHandle | 
       name: r.text("name"),
       description: r.text("description"),
       fieldType: fieldTypeOf(r.select("fieldType")),
-      choices: r.json<Choice[]>("choices", []),
-      config: r.json<FieldConfig>("config", {}),
+      choices: r.json<Choice[]>("choices", [], asChoices),
+      config: r.json<FieldConfig>("config", {}, asObject),
       order: r.num("order") ?? 0,
       archived: r.bool("archived"),
       archivedAt: r.instant("archivedAt"),
@@ -571,8 +751,8 @@ export function createNotionRepo(notion: NotionLike, registry: RegistryHandle | 
       key: r.text("key"),
       label: r.text("label"),
       fieldType: fieldTypeOf(r.select("fieldType")),
-      choices: r.json<Choice[]>("choices", []),
-      config: r.json<FieldConfig>("config", {}),
+      choices: r.json<Choice[]>("choices", [], asChoices),
+      config: r.json<FieldConfig>("config", {}, asObject),
       order: r.num("order") ?? 0,
       showInSummary: r.bool("showInSummary"),
       systemKey: sk === "customer" || sk === "projectType" ? (sk as SystemFieldKey) : undefined,
@@ -611,12 +791,12 @@ export function createNotionRepo(notion: NotionLike, registry: RegistryHandle | 
       code: r.text("code"),
       name: r.text("name"),
       status: fromLabel(PROJECT_STATUS_LABELS, r.select("status")) ?? "ACTIVE",
-      details: r.json<Project["details"]>("details", {}),
-      flow: r.json<Flow>("flow", EMPTY_FLOW),
-      cells: r.json<Project["cells"]>("cells", {}),
+      details: r.json<Project["details"]>("details", {}, asObject),
+      flow: r.json<Flow>("flow", { nodes: {}, edges: [] }, asFlow),
+      cells: r.json<Project["cells"]>("cells", {}, asCells),
       progress: pct === null ? 0 : Math.round(pct * 10_000) / 100,
       templateRevision: r.num("templateRevision") ?? 0,
-      syncDismissed: r.json<Record<string, string>>("syncDismissed", {}),
+      syncDismissed: r.json<Record<string, string>>("syncDismissed", {}, asObject),
       setup: setup && setup.toLowerCase() === SETUP_LABELS.CREATING.toLowerCase() ? "CREATING" : "READY",
       archived: r.bool("archived"),
       archivedAt: r.instant("archivedAt"),
@@ -664,9 +844,9 @@ export function createNotionRepo(notion: NotionLike, registry: RegistryHandle | 
       name: r.text("name"),
       description: r.text("description"),
       fieldType: fieldTypeOf(r.select("fieldType")),
-      choices: r.json<Choice[]>("choices", []),
-      config: r.json<FieldConfig>("config", {}),
-      value: r.json<Value | null>("valueData", null),
+      choices: r.json<Choice[]>("choices", [], asChoices),
+      config: r.json<FieldConfig>("config", {}, asObject),
+      value: r.json<Value | null>("valueData", null, asValue),
       notApplicable: r.bool("notApplicable"),
       flag: fromLabel(FLAG_LABELS, r.select("flag")) ?? null,
       order: r.num("order") ?? 0,
@@ -732,7 +912,7 @@ export function createNotionRepo(notion: NotionLike, registry: RegistryHandle | 
       summary: r.text("summary"),
       oldDisplay: r.optText("oldValue"),
       newDisplay: r.optText("newValue"),
-      data: r.json<Record<string, unknown> | undefined>("data", undefined),
+      data: r.json<Record<string, unknown> | undefined>("data", undefined, asObject),
       correlationId: r.optText("correlation"),
       externalRef: r.optText("externalRef"),
       occurredAt: normInstant(r.text("occurredAtExact")) ?? r.instant("occurredAt") ?? r.created,
@@ -806,7 +986,7 @@ export function createNotionRepo(notion: NotionLike, registry: RegistryHandle | 
       stepId: r.ids("step")[0],
       kind,
       name: r.text("name"),
-      url: kind === "LINK" ? (r.url("link") ?? undefined) : undefined,
+      url: kind === "LINK" ? (isHttpUrl(r.url("link")) ? (r.url("link") as string) : undefined) : undefined,
       size: r.num("size") ?? undefined,
       contentType: r.optText("contentType"),
       archived: r.bool("archived"),
@@ -820,14 +1000,25 @@ export function createNotionRepo(notion: NotionLike, registry: RegistryHandle | 
       get: <T = unknown>(key: string) =>
         call(async (reg) => {
           const e = entry(reg, "settings");
-          const row = await dsScoped(findSettingRow(notion, e, key));
+          const row = await settingRow(e, key);
           if (!row) return undefined;
           return new Row(row, e).json<T | undefined>("value", undefined);
         }),
+      // One row per key: calls for one key run one after another in this instance, and the row id is remembered.
       set: (key, value) =>
-        call(async (reg) => {
-          await dsScoped(upsertSettingRow(notion, entry(reg, "settings"), key, value));
-        }),
+        call((reg) =>
+          serial(key, async () => {
+            const e = entry(reg, "settings");
+            const w = new Writes(e).title("key", key, `Setting ${key}`).json("value", value, `Setting ${key}`);
+            const row = await settingRow(e, key);
+            if (row) {
+              await updatePage(e, row.id, w);
+              return;
+            }
+            const created = await createPage(e, w);
+            settingIds.set(key, created.id);
+          }),
+        ),
       list: (prefix) =>
         call(async (reg) => {
           const e = entry(reg, "settings");
@@ -836,12 +1027,21 @@ export function createNotionRepo(notion: NotionLike, registry: RegistryHandle | 
             sorts: [{ timestamp: "created_time", direction: "ascending" }],
           });
           const out: Record<string, unknown> = {};
-          for (const p of pages) {
+          const take = (p: PageObjectResponse) => {
             const r = new Row(p, e);
             const k = r.text("key");
-            if (!k || (prefix && !k.startsWith(prefix)) || k in out) continue;
+            if (!k || (prefix && !k.startsWith(prefix)) || k in out) return;
             out[k] = r.json<unknown>("value", undefined);
+            if (!settingIds.has(k)) settingIds.set(k, p.id);
+          };
+          // A row this instance wrote moments ago may not be in the query yet: read those by id.
+          for (const [k, id] of settingIds) {
+            if (prefix && !k.startsWith(prefix)) continue;
+            if (pages.some((p) => normalizeId(p.id) === normalizeId(id))) continue;
+            const p = await getPage(e, id);
+            if (p) take(p);
           }
+          for (const p of pages) take(p);
           return out;
         }),
     },
@@ -918,13 +1118,25 @@ export function createNotionRepo(notion: NotionLike, registry: RegistryHandle | 
           const e = entry(reg, "projects");
           const wanted = code.trim().toUpperCase();
           if (!wanted) return null;
+          const matches = (p: PageObjectResponse) => new Row(p, e).text("code").trim().toUpperCase() === wanted;
           const res = await query(e, {
             filter: { property: e.props.code, title: { equals: wanted } },
             sorts: [{ timestamp: "created_time", direction: "ascending" }],
             page_size: 10,
             filter_properties: projectReadProps(e),
           });
-          const hit = res.results.filter(isFullPage).find((p) => new Row(p, e).text("code").trim().toUpperCase() === wanted);
+          let hit = res.results.filter(isFullPage).find(matches) ?? null;
+          if (!hit) {
+            // Notion does not document whether `equals` ignores case, and a code can be retyped in Notion.
+            // Look again with `contains` (codes only, light), then read the match.
+            const light = await queryAll(e, {
+              filter: { property: e.props.code, title: { contains: wanted } },
+              sorts: [{ timestamp: "created_time", direction: "ascending" }],
+              filter_properties: [e.props.code],
+            });
+            const found = light.find(matches);
+            if (found) hit = await getPage(e, found.id, projectReadProps(e));
+          }
           return hit ? toProject(new Row(hit, e)) : null;
         }),
       create: (input) =>
@@ -943,6 +1155,7 @@ export function createNotionRepo(notion: NotionLike, registry: RegistryHandle | 
       listByProject: (projectId, opts) =>
         call(async (reg) => {
           const e = entry(reg, "steps");
+          if (!extractNotionId(projectId)) return [];
           const pages = await queryAll(e, {
             filter: all(relContains(e, "project", projectId), opts?.includeArchived ? undefined : notArchived(e)),
             sorts: [
@@ -1022,10 +1235,13 @@ export function createNotionRepo(notion: NotionLike, registry: RegistryHandle | 
           try {
             return toHistory(new Row(await createPage(e, w), e));
           } catch (err) {
-            // A related step that no longer exists must not lose the log row (Related steps is not hashed).
+            // A related step that no longer exists must not lose the log row (Related steps is not hashed). Notion may
+            // answer that with 400 or 404 (a 404 first looks like a stale data source); if the data source really is
+            // stale, the retry below fails the same way and the whole call is redone with fresh ids.
             const relId = e.props.relatedSteps;
             const rel = w.props[relId];
-            if (!isNotionCode(err, "validation_error") || !rel || !("relation" in rel) || rel.relation.length === 0) throw err;
+            const maybeRelated = isNotionCode(err, "validation_error") || (err instanceof StaleRegistry && err.kind === "dataSource");
+            if (!maybeRelated || !rel || !("relation" in rel) || rel.relation.length === 0) throw err;
             w.props[relId] = { relation: [] };
             return toHistory(new Row(await createPage(e, w), e));
           }
@@ -1042,10 +1258,15 @@ export function createNotionRepo(notion: NotionLike, registry: RegistryHandle | 
           return res.results.filter(isFullPage).some((p) => new Row(p, e).text("opId") === opId);
         }),
       listByStep: (stepId, q) =>
-        call((reg) =>
-          historyPage(reg, q, (e) => ({ or: [relContains(e, "step", stepId), relContains(e, "relatedSteps", stepId)] }) as FilterItem),
+        call(async (reg) =>
+          extractNotionId(stepId)
+            ? historyPage(reg, q, (e) => ({ or: [relContains(e, "step", stepId), relContains(e, "relatedSteps", stepId)] }) as FilterItem)
+            : { items: [], nextCursor: null },
         ),
-      listByProject: (projectId, q) => call((reg) => historyPage(reg, q, (e) => relContains(e, "project", projectId))),
+      listByProject: (projectId, q) =>
+        call(async (reg) =>
+          extractNotionId(projectId) ? historyPage(reg, q, (e) => relContains(e, "project", projectId)) : { items: [], nextCursor: null },
+        ),
       listAll: (q) => call((reg) => historyPage(reg, q)),
     },
 
@@ -1053,6 +1274,7 @@ export function createNotionRepo(notion: NotionLike, registry: RegistryHandle | 
       listByProject: (projectId, opts) =>
         call(async (reg) => {
           const e = entry(reg, "notes");
+          if (!extractNotionId(projectId)) return [];
           const pages = await queryAll(e, {
             filter: all(relContains(e, "project", projectId), opts?.includeArchived ? undefined : notArchived(e)),
             sorts: [
@@ -1079,6 +1301,7 @@ export function createNotionRepo(notion: NotionLike, registry: RegistryHandle | 
       listByProject: (projectId, opts) =>
         call(async (reg) => {
           const e = entry(reg, "files");
+          if (!extractNotionId(projectId)) return [];
           const pages = await queryAll(e, {
             filter: all(relContains(e, "project", projectId), opts?.includeArchived ? undefined : notArchived(e)),
             sorts: [
@@ -1098,6 +1321,7 @@ export function createNotionRepo(notion: NotionLike, registry: RegistryHandle | 
         call(async (reg) => {
           const e = entry(reg, "files");
           if (input.url.length > 2000) throw new ValueTooLargeError("Links can be at most 2,000 characters long.");
+          if (!isHttpUrl(input.url)) throw new NotionError("Enter a web address starting with http:// or https://.", { code: "invalid_url", status: 400 });
           const w = new Writes(e)
             .title("name", input.name || input.url, "The link name")
             .rel("project", [input.projectId])
@@ -1113,11 +1337,22 @@ export function createNotionRepo(notion: NotionLike, registry: RegistryHandle | 
           const e = entry(reg, "files");
           const size = Math.max(input.size, input.data.size);
           if (size > MAX_FILE_BYTES) throw new FileTooLargeError(size, MAX_FILE_BYTES);
-          const up = await notion.fileUploads.create({
-            mode: "single_part",
-            filename: input.name,
-            content_type: input.contentType || "application/octet-stream",
-          });
+          let up: Awaited<ReturnType<NotionLike["fileUploads"]["create"]>>;
+          try {
+            up = await notion.fileUploads.create({
+              mode: "single_part",
+              filename: input.name,
+              content_type: input.contentType || "application/octet-stream",
+            });
+          } catch (err) {
+            if (isNotionCode(err, "validation_error") && /extension|file type|content.?type|not supported/i.test(rawNotionMessage(err))) {
+              throw new NotionError(
+                "Notion does not accept this type of file (for example Outlook .msg or .eml). Put it in a .zip file, or save it in SharePoint or OneDrive and paste the link instead.",
+                { code: "unsupported_file_type", status: 400, notionCode: "validation_error" },
+              );
+            }
+            throw err;
+          }
           await notion.fileUploads.send({ file_upload_id: up.id, file: { filename: input.name, data: input.data } });
           const w = new Writes(e)
             .title("name", input.name, "The file name")
@@ -1146,9 +1381,18 @@ export function createNotionRepo(notion: NotionLike, registry: RegistryHandle | 
           const p = await getPage(e, id);
           if (!p) throw new NotSharedError("This file no longer exists in Notion.");
           const r = new Row(p, e);
-          const f = r.files("file")[0];
+          const all = r.files("file");
+          // Prefer a file stored in Notion; an external link added in Notion is flagged for a redirect.
+          const f = all.find((x) => !x.external) ?? all[0];
           if (!f) throw new NotionError("This attachment has no file.", { code: "no_file" });
-          return compact({ url: f.url, name: r.text("name") || f.name, contentType: r.optText("contentType"), size: r.num("size") ?? undefined });
+          if (f.external && !isHttpUrl(f.url)) throw new NotionError("This attachment links to an address the app cannot open.", { code: "no_file" });
+          return compact({
+            url: f.url,
+            name: r.text("name") || f.name,
+            contentType: f.external ? undefined : r.optText("contentType"),
+            size: f.external ? undefined : (r.num("size") ?? undefined),
+            external: f.external ? true : undefined,
+          });
         }),
     },
   };

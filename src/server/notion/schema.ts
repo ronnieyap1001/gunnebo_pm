@@ -117,7 +117,7 @@ export const SETUP_LABELS = { CREATING: "Creating", READY: "Ready" } as const;
 
 export const KIND_LABELS = { FILE: "File", LINK: "Link" } as const;
 
-/** Event types known when the schema was written (pre-created in History → Type; others are added on first use). */
+/** Event types the services log (pre-created in History → Type; others are added on first use). Keep in step with services/context EV. */
 export const KNOWN_EVENT_TYPES: readonly string[] = [
   "project.created",
   "project.updated",
@@ -125,23 +125,24 @@ export const KNOWN_EVENT_TYPES: readonly string[] = [
   "project.archived",
   "project.restored",
   "project.synced",
-  "node.value_changed",
-  "node.na_changed",
-  "node.flag_changed",
-  "node.added",
-  "node.updated",
-  "node.archived",
-  "node.restored",
-  "node.definition_synced",
-  "node.type_adopted",
+  "step.value_changed",
+  "step.na_changed",
+  "step.flag_changed",
+  "step.date_confirmed",
+  "step.added",
+  "step.updated",
+  "step.archived",
+  "step.restored",
   "edge.added",
   "edge.archived",
   "edge.restored",
   "note.added",
   "note.edited",
   "note.archived",
+  "note.restored",
   "attachment.added",
   "attachment.archived",
+  "attachment.restored",
   "milestone.created",
   "milestone.updated",
   "milestone.archived",
@@ -150,11 +151,13 @@ export const KNOWN_EVENT_TYPES: readonly string[] = [
   "template.edge_added",
   "template.edge_archived",
   "template.imported",
+  "template.seeded",
   "template.snapshot",
   "project_field.created",
   "project_field.updated",
   "project_field.archived",
   "project_field.restored",
+  "settings.updated",
   "system.setup",
 ];
 
@@ -436,8 +439,27 @@ export function parsePropMarker(description: string | null | undefined): string 
   return m ? m[1] : null;
 }
 
-export function dbDescription(key: DbKey): string {
-  return `${SCHEMA[key].description} (${dbMarker(key)})`;
+/** Database description: text, marker and (Settings only) the pointer to the saved property map row. */
+export function dbDescription(key: DbKey, mapPageId?: string): string {
+  const base = `${SCHEMA[key].description} (${dbMarker(key)})`;
+  return mapPageId ? `${base} ${mapPointer(mapPageId)}` : base;
+}
+
+const MAP_POINTER_RE = /\[map:([0-9a-f]{32})\]/i;
+
+/**
+ * `[map:<page id>]` in the Settings description points at the 'schema.registry' row, so discovery reads the saved
+ * property map by id (always current) instead of through a query (which may lag behind a write).
+ */
+export function mapPointer(pageId: string): string {
+  return `[map:${pageId.replace(/-/g, "").toLowerCase()}]`;
+}
+
+export function parseMapPointer(description: string | null | undefined): string | null {
+  const m = description ? MAP_POINTER_RE.exec(description) : null;
+  if (!m) return null;
+  const h = m[1].toLowerCase();
+  return `${h.slice(0, 8)}-${h.slice(8, 12)}-${h.slice(12, 16)}-${h.slice(16, 20)}-${h.slice(20)}`;
 }
 
 /** Property definition for databases.create / dataSources.update. `dsId` resolves relation targets. */

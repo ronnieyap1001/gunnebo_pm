@@ -160,13 +160,17 @@ interface FakeState {
 
 export interface FaultSpec {
   /** HTTP status to fail with. */
-  status: 401 | 403 | 404 | 409 | 429 | 500 | 502 | 503 | 504 | 529;
+  status: 400 | 401 | 403 | 404 | 409 | 429 | 500 | 502 | 503 | 504 | 529;
   /** Notion error code (derived from status when omitted). */
   code?: `${APIErrorCode}`;
+  /** Notion's error message (default: "Injected <status> (<code>)."). */
+  message?: string;
   /** Retry-After header in seconds. */
   retryAfterSec?: number;
   /** Apply the request, then fail (models a 503 whose write was already committed). */
   afterCommit?: boolean;
+  /** With afterCommit on a create: put the new object's id in additional_data.committed_resource_id (default true). */
+  reportCommittedId?: boolean;
   /** Only calls to this method, e.g. 'pages.update'. */
   method?: FakeMethod;
   /** How many matching calls fail (default 1). */
@@ -228,6 +232,13 @@ export interface FakeNotionOptions {
   maxFileBytes?: number;
   /** Drop seconds from date-time values (in case Notion stores minutes only; the app must not rely on more). */
   minuteDateTimes?: boolean;
+  /**
+   * New pages stay invisible to dataSources.query for this long (ms of the fake clock). Notion does not document
+   * that a query sees a page right after it was created, so read-after-write designs must not rely on it.
+   */
+  queryLagMs?: number;
+  /** Return each title / rich_text value as ONE merged item (Notion may merge or re-split items on read). */
+  mergeRichTextOnRead?: boolean;
 }
 
 // ---------------------------------------------------------------------------
@@ -303,6 +314,8 @@ function notFound(kind: string, id: string): never {
 
 function codeForStatus(status: number): `${APIErrorCode}` {
   switch (status) {
+    case 400:
+      return APIErrorCode.ValidationError;
     case 401:
       return APIErrorCode.Unauthorized;
     case 403:
@@ -444,27 +457,27 @@ export function createFakeNotion(opts: FakeNotionOptions = {}): FakeNotion {
 
   // -- persistence --------------------------------------------------------
   function load(): void {
-    if (!file || !fs.existsSync(file)) return;
+    if (!file || !fs.existsSync(/*turbopackIgnore: true*/ file)) return;
     try {
-      const parsed = JSON.parse(fs.readFileSync(file, "utf8")) as FakeState;
+      const parsed = JSON.parse(fs.readFileSync(/*turbopackIgnore: true*/ file, "utf8")) as FakeState;
       if (parsed && parsed.v === 1) state = parsed;
-      fileMtime = fs.statSync(file).mtimeMs;
+      fileMtime = fs.statSync(/*turbopackIgnore: true*/ file).mtimeMs;
     } catch (e) {
       throw new Error(`Fake Notion: could not read ${file} (${(e as Error).message}). Delete it to start over.`);
     }
   }
   function reloadIfChanged(): void {
-    if (!file || !fs.existsSync(file)) return;
-    const m = fs.statSync(file).mtimeMs;
+    if (!file || !fs.existsSync(/*turbopackIgnore: true*/ file)) return;
+    const m = fs.statSync(/*turbopackIgnore: true*/ file).mtimeMs;
     if (m !== fileMtime) load();
   }
   function persist(): void {
     if (!file) return;
-    fs.mkdirSync(path.dirname(file), { recursive: true });
+    fs.mkdirSync(/*turbopackIgnore: true*/ path.dirname(file), { recursive: true });
     const tmp = `${file}.${process.pid}.tmp`;
-    fs.writeFileSync(tmp, JSON.stringify(state));
-    fs.renameSync(tmp, file);
-    fileMtime = fs.statSync(file).mtimeMs;
+    fs.writeFileSync(/*turbopackIgnore: true*/ tmp, JSON.stringify(state));
+    fs.renameSync(/*turbopackIgnore: true*/ tmp, file);
+    fileMtime = fs.statSync(/*turbopackIgnore: true*/ file).mtimeMs;
   }
   load();
 
@@ -475,14 +488,14 @@ export function createFakeNotion(opts: FakeNotionOptions = {}): FakeNotion {
       up.data = buf.toString("base64");
       return;
     }
-    fs.mkdirSync(filesDir, { recursive: true });
-    fs.writeFileSync(path.join(filesDir, `${up.id}.bin`), buf);
+    fs.mkdirSync(/*turbopackIgnore: true*/ filesDir, { recursive: true });
+    fs.writeFileSync(/*turbopackIgnore: true*/ path.join(filesDir, `${up.id}.bin`), buf);
   }
   function readBytes(up: FakeUpload): Buffer | null {
     if (up.data !== undefined) return Buffer.from(up.data, "base64");
     if (!filesDir) return null;
     const p = path.join(filesDir, `${up.id}.bin`);
-    return fs.existsSync(p) ? fs.readFileSync(p) : null;
+    return fs.existsSync(/*turbopackIgnore: true*/ p) ? fs.readFileSync(/*turbopackIgnore: true*/ p) : null;
   }
 
   const nextSeq = () => ++state.seq;
@@ -751,14 +764,20 @@ export function createFakeNotion(opts: FakeNotionOptions = {}): FakeNotion {
   }
 
   // -- responses --------------------------------------------------------------
+  /** Optionally merges plain items into one (which can then be longer than 2,000 characters). */
+  function readItems(items: RichTextItemResponse[]): RichTextItemResponse[] {
+    if (!opts.mergeRichTextOnRead || items.length < 2) return items;
+    return richText(plain(items));
+  }
+
   function valueResponse(prop: FakeProp, page: FakePage): unknown {
     const v = page.values[prop.id];
     const base = { id: prop.id, type: prop.type };
     switch (prop.type) {
       case "title":
-        return { ...base, title: v && v.type === "title" ? v.title : [] };
+        return { ...base, title: v && v.type === "title" ? readItems(v.title) : [] };
       case "rich_text":
-        return { ...base, rich_text: v && v.type === "rich_text" ? v.rich_text : [] };
+        return { ...base, rich_text: v && v.type === "rich_text" ? readItems(v.rich_text) : [] };
       case "number":
         return { ...base, number: v && v.type === "number" ? v.number : null };
       case "checkbox":
@@ -1123,6 +1142,13 @@ export function createFakeNotion(opts: FakeNotionOptions = {}): FakeNotion {
     if (!prop) invalid(`Could not find property with name or id: ${f.property}`);
     const key = Object.keys(f).find((k) => k !== "property" && k !== "type");
     if (key !== prop.type) invalid(`body.filter: property ${prop.name} is ${prop.type}, but the filter is ${key}.`);
+    // Values are validated up front too (even when no row would be compared).
+    const cond = f[key];
+    if (!isObject(cond)) invalid(`body.filter.${key} should be an object.`);
+    if (prop.type === "relation") {
+      if ("contains" in cond) normId(cond.contains, `body.filter.relation.contains`);
+      if ("does_not_contain" in cond) normId(cond.does_not_contain, `body.filter.relation.does_not_contain`);
+    }
   }
 
   function evalFilter(ds: FakeDataSource, page: FakePage, f: unknown, depth: number): boolean {
@@ -1257,7 +1283,7 @@ export function createFakeNotion(opts: FakeNotionOptions = {}): FakeNotion {
     const code = f.code ?? codeForStatus(f.status);
     const headers: Record<string, string> = {};
     if (f.retryAfterSec !== undefined) headers["retry-after"] = String(f.retryAfterSec);
-    return apiError(f.status, code, `Injected ${f.status} (${code}).`, { headers, additional_data: f.additional_data });
+    return apiError(f.status, code, f.message ?? `Injected ${f.status} (${code}).`, { headers, additional_data: f.additional_data });
   }
   function checkPayload(args: unknown): void {
     const bytes = Buffer.byteLength(JSON.stringify(args ?? {}), "utf8");
@@ -1278,7 +1304,11 @@ export function createFakeNotion(opts: FakeNotionOptions = {}): FakeNotion {
       if (method !== "fileUploads.send") checkPayload(args);
       const result = await fn();
       if (write) persist();
-      if (fault?.afterCommit) throw faultError(fault);
+      if (fault?.afterCommit) {
+        const id = isObject(result) && typeof result.id === "string" ? result.id : undefined;
+        const report = fault.reportCommittedId !== false && method.endsWith(".create") && id && !fault.additional_data;
+        throw faultError(report ? { ...fault, additional_data: { committed_resource_id: id } } : fault);
+      }
       return structuredClone(result);
     } finally {
       inFlight--;
@@ -1379,11 +1409,17 @@ export function createFakeNotion(opts: FakeNotionOptions = {}): FakeNotion {
             }
             if (!isObject(raw)) invalid(`${where} should be an object.`);
             if (prop) {
-              const cfgKey = valueKey(raw);
+              const cfgKey = Object.keys(raw).find((x) => x !== "type" && x !== "id" && x !== "name" && x !== "description");
               const newName = typeof raw.name === "string" ? raw.name : undefined;
               if (newName !== undefined) finalNames.set(prop.id, newName);
-              if (cfgKey && cfgKey !== "description" && cfgKey !== prop.type) {
-                invalid(`${where}: the fake cannot change a property's type (${prop.type} → ${cfgKey}).`);
+              // A type change keeps the property id (as in Notion); existing values are dropped.
+              let newType: string | undefined;
+              if (cfgKey && cfgKey !== prop.type) {
+                const changeable = ["rich_text", "number", "select", "checkbox", "date", "url", "files"];
+                if (!changeable.includes(cfgKey) || !changeable.includes(prop.type)) {
+                  invalid(`${where}: the fake cannot change a property's type (${prop.type} → ${cfgKey}).`);
+                }
+                newType = cfgKey;
               }
               let options: SelectOption[] | undefined;
               if (cfgKey === "select") {
@@ -1395,6 +1431,16 @@ export function createFakeNotion(opts: FakeNotionOptions = {}): FakeNotion {
               const format = cfgKey === "number" && isObject(raw.number) && typeof raw.number.format === "string" ? raw.number.format : undefined;
               const description = "description" in raw ? (typeof raw.description === "string" ? raw.description : null) : undefined;
               ops.push(() => {
+                if (newType) {
+                  prop.type = newType;
+                  delete prop.select;
+                  delete prop.number;
+                  if (newType === "select") prop.select = { options: [] };
+                  if (newType === "number") prop.number = { format: "number" };
+                  for (const page of Object.values(state.pages)) {
+                    if (page.parent.type === "data_source_id" && page.parent.data_source_id === ds.id) delete page.values[prop.id];
+                  }
+                }
                 if (newName !== undefined) prop.name = newName;
                 if (description !== undefined) prop.description = description;
                 // Notion replaces the option list with the one sent (send the full list to keep options).
@@ -1442,8 +1488,14 @@ export function createFakeNotion(opts: FakeNotionOptions = {}): FakeNotion {
           const ds = liveDs(normId(args.data_source_id, "path.data_source_id"));
           const size = pageSizeOf(args.page_size);
           const trashed = args.in_trash ?? args.archived ?? false;
+          const lag = opts.queryLagMs ?? 0;
+          const t = now();
           let rows = Object.values(state.pages).filter(
-            (p) => p.parent.type === "data_source_id" && p.parent.data_source_id === ds.id && p.in_trash === trashed,
+            (p) =>
+              p.parent.type === "data_source_id" &&
+              p.parent.data_source_id === ds.id &&
+              p.in_trash === trashed &&
+              (lag <= 0 || t - p.created >= lag),
           );
           if (args.filter !== undefined) {
             checkFilter(ds, args.filter, 0);
@@ -1693,8 +1745,8 @@ export function createFakeNotion(opts: FakeNotionOptions = {}): FakeNotion {
     fileBytes,
     reset: () => {
       state = emptyState();
-      if (file && fs.existsSync(file)) fs.rmSync(file);
-      if (filesDir && fs.existsSync(filesDir)) fs.rmSync(filesDir, { recursive: true, force: true });
+      if (file && fs.existsSync(/*turbopackIgnore: true*/ file)) fs.rmSync(/*turbopackIgnore: true*/ file);
+      if (filesDir && fs.existsSync(/*turbopackIgnore: true*/ filesDir)) fs.rmSync(/*turbopackIgnore: true*/ filesDir, { recursive: true, force: true });
       fileMtime = 0;
     },
     pageCount: () => Object.keys(state.pages).length,

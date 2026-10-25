@@ -101,6 +101,11 @@ export interface FileDownload {
   name: string;
   contentType?: string;
   size?: number;
+  /**
+   * The file is an external link someone added in Notion, not a file stored in Notion: redirect to it, never fetch
+   * it on the server (it could point anywhere, including internal addresses).
+   */
+  external?: boolean;
 }
 
 export interface Repo {

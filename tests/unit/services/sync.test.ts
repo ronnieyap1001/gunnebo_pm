@@ -245,6 +245,20 @@ describe("sync from template", () => {
     expect((await previewSync(w.ctx(), projectId)).pendingCount).toBe(0);
   });
 
+  it("a step edited between two batches never gets its patch twice", async () => {
+    const dropdowns = (await w.repo.milestones.list()).filter((m) => m.fieldType === "DROPDOWN").slice(0, 12);
+    for (const m of dropdowns) await updateMilestone(w.ctx(), m.id, { choices: [...m.choices, { label: "Escalated", state: "BLOCKED" }] });
+    const preview = await previewSync(w.ctx(), projectId);
+    const opId = randomUUID();
+    await startSync(w.ctx({ opId }), { projectId, selectedIds: preview.items.map((i) => i.id) });
+    expect((await continueSync(w.ctx(), opId)).done).toBe(false); // 8 patches
+    const patched = (await stepsOf(w, projectId)).find((s) => s.rev === 1 && s.choices.some((c) => c.label === "Escalated"))!;
+    await setStepValue(w.ctx(), { stepId: patched.id, value: patched.choices[0].id, expectedRev: 1 });
+    while (!(await continueSync(w.ctx(), opId)).done);
+    expect((await w.repo.steps.get(patched.id))!.rev).toBe(2);
+    expect((await w.repo.steps.get(patched.id))!.value).toEqual({ choiceId: patched.choices[0].id });
+  });
+
   it("sync-all defaults apply ticked items only and store nothing as declined", async () => {
     const other = await createProject(w, { code: "C0900", name: "Other" });
     const bom = await milestoneByKey(w, "bom");

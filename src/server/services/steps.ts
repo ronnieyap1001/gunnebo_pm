@@ -582,7 +582,11 @@ export async function updateStepDefinition(
   return { ...done, changed: true };
 }
 
-/** Archives a project-only step (template-derived: FORBIDDEN, mark N/A instead) with "Reconnect neighbours". */
+/**
+ * Archives a project-only step (template-derived: FORBIDDEN, mark N/A instead) with "Reconnect neighbours".
+ * The batch id is the action's opId, so a retry of an interrupted archive recognises its own batch and finishes the
+ * arrows, the cell and the History row (archiveNodeInFlow is a no-op on arrows already archived).
+ */
 export async function archiveProjectStep(
   ctx: Ctx,
   stepId: string,
@@ -594,29 +598,41 @@ export async function archiveProjectStep(
       suggestNotApplicable: true,
     });
   }
-  if (step.archived) return { batchId: step.archiveBatch ?? "", project: mirrorsOf(project) };
-  const batchId = newId();
+  const batchId = ctx.opId;
+  if (step.archived && step.archiveBatch !== batchId) return { batchId: step.archiveBatch ?? "", project: mirrorsOf(project) };
   const result = archiveNodeInFlow(project.flow, stepId, {
     batchId,
     now: ctx.now,
     reconnect: opts.reconnect !== false,
     idFactory: newId,
   });
-  await ctx.repo.steps.update(stepId, { archived: true, archivedAt: ctx.now, archiveBatch: batchId, lastOp: ctx.opId });
+  if (!step.archived) {
+    await ctx.repo.steps.update(stepId, { archived: true, archivedAt: ctx.now, archiveBatch: batchId, lastOp: ctx.opId });
+  }
   const cells = { ...(project.cells ?? {}) };
   delete cells[stepId];
-  const mirrors = await writeMirrors(ctx, project, cells, { flow: result.flow });
+  const flowChanged = result.archivedEdgeIds.length > 0 || result.bridgeEdgeIds.length > 0;
+  const mirrors = await writeMirrors(ctx, project, cells, flowChanged ? { flow: result.flow } : {});
   await appendHistory(ctx, {
     type: EV.stepArchived,
     summary: summaryOf(project, `Archived "${step.name}"`),
     projectId: project.id,
     stepId,
-    data: { stepName: step.name, batchId, archivedEdgeIds: result.archivedEdgeIds, bridgeEdgeIds: result.bridgeEdgeIds },
+    data: {
+      stepName: step.name,
+      batchId,
+      archivedEdgeIds: result.flow.edges.filter((e) => e.archivedAt && e.batchId === batchId).map((e) => e.id),
+      bridgeEdgeIds: result.flow.edges.filter((e) => e.createdByBatchId === batchId).map((e) => e.id),
+    },
   });
   return { batchId, project: mirrors };
 }
 
-/** Undo a project-step archive: restores the batch's steps and arrows, removes the batch's bridge arrows. */
+/**
+ * Undo a project-step archive: restores the batch's steps and arrows, removes the batch's bridge arrows.
+ * Write order: project (arrows + cells) → History → steps, so a retry after a crash at any point finishes the job
+ * (restoreBatchInFlow is a no-op on a flow already restored; the History row is written once per opId).
+ */
 export async function restoreProjectBatch(
   ctx: Ctx,
   projectId: string,
@@ -626,22 +642,23 @@ export async function restoreProjectBatch(
   const all = await ctx.repo.steps.listByProject(projectId, { includeArchived: true });
   const batch = all.filter((s) => s.archived && s.archiveBatch === batchId);
   if (!batchId || batch.length === 0) return { restoredIds: [], skippedEdgeIds: [], project: mirrorsOf(project) };
-  const restored = await settleAll(
-    batch.map((s) => () =>
-      ctx.repo.steps.update(s.id, { archived: false, archivedAt: undefined, archiveBatch: undefined, lastOp: ctx.opId }),
-    ),
-  );
   const activeIds = new Set(all.filter((s) => !s.archived).map((s) => s.id));
   for (const s of batch) activeIds.add(s.id);
   const result = restoreBatchInFlow(project.flow, batchId, activeIds, ctx.now);
-  const fresh = project;
-  const cells = { ...(fresh.cells ?? {}) };
+  const restored: StoredStep[] = batch.map((s) => {
+    const r: StoredStep = { ...s, archived: false, lastOp: ctx.opId };
+    delete r.archivedAt;
+    delete r.archiveBatch;
+    return r;
+  });
+  const cells = { ...(project.cells ?? {}) };
   const counts = await stepAttachmentCounts(ctx, projectId);
   for (const s of restored) cells[s.id] = buildCell(s, counts[s.id] ?? 0);
   let flow = result.flow;
   const missing = restored.filter((s) => !flow.nodes[s.id]).map((s) => s.id);
   if (missing.length) flow = { nodes: { ...flow.nodes, ...defaultPositions(missing, Object.values(flow.nodes)) }, edges: flow.edges };
-  const mirrors = await writeMirrors(ctx, fresh, cells, { flow });
+  const flowChanged = stableStringify(flow) !== stableStringify(project.flow);
+  const mirrors = await writeMirrors(ctx, project, cells, flowChanged ? { flow } : {});
   await appendHistory(ctx, {
     type: EV.stepRestored,
     summary: summaryOf(project, `Restored ${batch.map((s) => `"${s.name}"`).join(", ")}`),
@@ -655,6 +672,11 @@ export async function restoreProjectBatch(
       removedBridgeIds: result.removedBridgeIds,
     },
   });
+  await settleAll(
+    batch.map((s) => () =>
+      ctx.repo.steps.update(s.id, { archived: false, archivedAt: undefined, archiveBatch: undefined, lastOp: ctx.opId }),
+    ),
+  );
   return { restoredIds: batch.map((s) => s.id), skippedEdgeIds: result.skippedEdgeIds, project: mirrors };
 }
 

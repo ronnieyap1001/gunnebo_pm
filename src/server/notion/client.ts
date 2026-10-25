@@ -3,7 +3,7 @@ import path from "node:path";
 import { Client, isNotionClientError, APIErrorCode } from "@notionhq/client";
 import type { PageObjectResponse } from "@notionhq/client";
 import type { StorageMode } from "@/server/repo/types";
-import { NotConfiguredError } from "./errors";
+import { NotConfiguredError, scrubNotionMessage } from "./errors";
 import { createFakeNotion } from "./fake";
 
 // ---------------------------------------------------------------------------
@@ -86,6 +86,26 @@ export function storageMode(env: EnvLike = process.env): StorageMode {
 }
 
 type ClientOptions = NonNullable<ConstructorParameters<typeof Client>[0]>;
+type Logger = NonNullable<ClientOptions["logger"]>;
+
+/**
+ * Logger for the SDK: level, event and the error code / request id only. Notion's own messages can echo
+ * submitted values ("…instead was `"Acme, Inc."`"), so they are scrubbed; response bodies are never logged.
+ * The SDK never passes the token to its logger.
+ */
+export const safeNotionLogger: Logger = (level, message, extraInfo) => {
+  const info: Record<string, unknown> = {};
+  for (const k of ["code", "attempt", "requestId", "request_id", "status", "method", "path", "delayMs"]) {
+    const v = extraInfo?.[k];
+    if (typeof v === "string" || typeof v === "number") info[k] = v;
+  }
+  if (typeof extraInfo?.message === "string") info.message = scrubNotionMessage(extraInfo.message);
+  const lvl = String(level);
+  const line = `@notionhq/client ${lvl}: ${message}`;
+  if (lvl === "error") console.error(line, info);
+  else if (lvl === "warn") console.warn(line, info);
+  else console.info(line, info);
+};
 
 /**
  * The real SDK client with the agreed retry policy. The SDK retries 429/529 on every method and
@@ -99,6 +119,7 @@ export function createRealNotion(opts: { auth: string; fetch?: ClientOptions["fe
     retry: { maxRetries: 3, initialRetryDelayMs: 500, maxRetryDelayMs: 8_000 },
     fetch: opts.fetch,
     logLevel: opts.logLevel,
+    logger: safeNotionLogger,
   });
 }
 
@@ -106,17 +127,21 @@ export function createRealNotion(opts: { auth: string; fetch?: ClientOptions["fe
 // Concurrency gate (per instance; not global across Vercel instances)
 // ---------------------------------------------------------------------------
 
+/**
+ * At most `limit` calls of `fn` run at once. A finished call hands its slot straight to the next waiter, so a
+ * newcomer arriving between the release and the waiter's wake-up cannot slip in and exceed the limit.
+ */
 export function createGate(limit: number): <T>(fn: () => Promise<T>) => Promise<T> {
   let active = 0;
   const waiting: (() => void)[] = [];
   const release = () => {
-    active--;
     const next = waiting.shift();
-    if (next) next();
+    if (next) next(); // the slot passes to `next`; `active` stays the same
+    else active--;
   };
   return async <T>(fn: () => Promise<T>): Promise<T> => {
     if (active >= limit) await new Promise<void>((resolve) => waiting.push(resolve));
-    active++;
+    else active++;
     try {
       return await fn();
     } finally {
