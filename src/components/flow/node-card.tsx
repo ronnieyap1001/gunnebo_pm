@@ -93,7 +93,18 @@ function NodeCardImpl({ data, selected }: NodeProps<CardNode>) {
   const template = d.mode === "template";
   const na = d.state === "NOT_APPLICABLE";
   const cls = template ? "state-ns" : stateClass(d.state);
-  const label = `${d.name}: ${d.value}${template ? "" : ` (${STATE_META[d.state].label})`}`;
+  // Everything the colours and marks say, in words (tooltip and screen readers).
+  const marks = template
+    ? []
+    : [
+        STATE_META[d.state].label,
+        d.current ? "current" : "",
+        d.flag ? `flagged ${d.flag === "BLOCKED" ? "Blocked" : "Waiting"}` : "",
+        d.passedAuto ? "date passed, not confirmed" : "",
+        d.projectOnly ? "project-only" : "",
+        d.warning ?? "",
+      ].filter(Boolean);
+  const label = `${d.name}: ${d.value}${marks.length ? ` (${marks.join(", ")})` : ""}`;
 
   const handles = (
     <>
@@ -101,13 +112,13 @@ function NodeCardImpl({ data, selected }: NodeProps<CardNode>) {
         type="target"
         position={Position.Left}
         isConnectable={d.connectable}
-        className={cn("!size-2 !border-background !bg-muted-foreground", !d.connectable && "!opacity-0")}
+        className={cn("!size-2.5 !border-background !bg-muted-foreground", !d.connectable && "!opacity-0")}
       />
       <Handle
         type="source"
         position={Position.Right}
         isConnectable={d.connectable}
-        className={cn("!size-2 !border-background !bg-muted-foreground", !d.connectable && "!opacity-0")}
+        className={cn("!size-2.5 !border-background !bg-muted-foreground", !d.connectable && "!opacity-0")}
       />
     </>
   );
@@ -116,6 +127,7 @@ function NodeCardImpl({ data, selected }: NodeProps<CardNode>) {
     return (
       <div
         aria-label={label}
+        title={label}
         style={{ width: NODE_W, height: NODE_H }}
         className={cn(
           cls,
@@ -136,46 +148,53 @@ function NodeCardImpl({ data, selected }: NodeProps<CardNode>) {
   return (
     <div
       aria-label={label}
+      title={label}
       style={{ width: NODE_W, height: NODE_H }}
       className={cn(
         cls,
-        "relative flex overflow-hidden rounded-md border bg-[var(--s-bg)] text-left shadow-xs",
+        "relative rounded-md border bg-[var(--s-bg)] text-left shadow-xs",
         template ? "border-border bg-card" : "border-[var(--s-border)]",
         na && "border-dashed opacity-50",
         d.current && "ring-2 ring-[var(--current-ring)] ring-offset-1 ring-offset-background",
         selected && "outline outline-2 outline-offset-2 outline-foreground",
       )}
     >
-      {!na && !template ? <div className="w-1 shrink-0 bg-[var(--s-solid)]" aria-hidden /> : null}
-      <div className={cn("flex min-w-0 flex-1 flex-col justify-center px-2", compact ? "gap-0.5" : "gap-0.5 pr-7")}>
-        <div className="flex min-w-0 items-start gap-1">
-          {!compact && !template ? <StateIcon state={d.state} className="mt-px size-3" /> : null}
-          {!compact && template ? <FileText className="mt-px size-3 shrink-0 text-muted-foreground" aria-hidden /> : null}
-          <span
+      {/* Content is clipped to the rounded card; the connection dots sit outside the clip so they stay whole. */}
+      <div className="absolute inset-0 flex overflow-hidden rounded-[inherit]">
+        {!na && !template ? <div className="w-1 shrink-0 bg-[var(--s-solid)]" aria-hidden /> : null}
+        <div className={cn("flex min-w-0 flex-1 flex-col justify-center px-2", compact ? "gap-0.5" : "gap-0.5 pr-7")}>
+          <div className="flex min-w-0 items-start gap-1">
+            {!compact && !template ? <StateIcon state={d.state} className="mt-px size-3" /> : null}
+            {!compact && template ? <FileText className="mt-px size-3 shrink-0 text-muted-foreground" aria-hidden /> : null}
+            <span
+              className={cn(
+                "min-w-0 font-medium leading-tight text-foreground",
+                compact ? "truncate text-[17px]" : "line-clamp-2 text-xs",
+              )}
+            >
+              {d.name}
+            </span>
+          </div>
+          <div
+            // A fresh element per zoom tier: Chromium otherwise sometimes keeps painting the other tier's glyph size
+            // after zooming (layout says 11 px, the screen shows 15 px).
+            key={compact ? "compact" : "full"}
             className={cn(
-              "min-w-0 font-medium leading-tight text-foreground",
-              compact ? "truncate text-[15px]" : "line-clamp-2 text-xs",
+              "truncate tabular-nums leading-tight",
+              template ? "text-muted-foreground" : "text-[var(--s-fg)]",
+              compact ? "text-[15px]" : "text-[11px]",
             )}
           >
-            {d.name}
-          </span>
+            {template ? d.typeLine ?? d.value : d.value}
+          </div>
         </div>
-        <div
-          className={cn(
-            "truncate tabular-nums leading-tight",
-            template ? "text-muted-foreground" : "text-[var(--s-fg)]",
-            compact ? "text-sm" : "text-[11px]",
-          )}
-        >
-          {template ? d.typeLine ?? d.value : d.value}
-        </div>
+        {!compact ? <Indicators d={d} /> : null}
+        {typeof d.percent === "number" && !na ? (
+          <div className="absolute inset-x-0 bottom-0 h-0.5 bg-[var(--s-border)]" aria-hidden>
+            <div className="h-full bg-[var(--s-solid)]" style={{ width: `${Math.max(0, Math.min(100, d.percent))}%` }} />
+          </div>
+        ) : null}
       </div>
-      {!compact ? <Indicators d={d} /> : null}
-      {typeof d.percent === "number" && !na ? (
-        <div className="absolute inset-x-0 bottom-0 h-0.5 bg-[var(--s-border)]" aria-hidden>
-          <div className="h-full bg-[var(--s-solid)]" style={{ width: `${Math.max(0, Math.min(100, d.percent))}%` }} />
-        </div>
-      ) : null}
       {handles}
     </div>
   );

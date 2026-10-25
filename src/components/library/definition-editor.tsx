@@ -11,7 +11,7 @@ import {
   type DragEndEvent,
 } from "@dnd-kit/core";
 import { SortableContext, arrayMove, sortableKeyboardCoordinates, useSortable, verticalListSortingStrategy } from "@dnd-kit/sortable";
-import { Archive, ArchiveRestore, Copy, GripVertical, Plus } from "lucide-react";
+import { Archive, ArchiveRestore, Copy, GripVertical, Plus, Search } from "lucide-react";
 import type { Choice, FieldConfig, FieldType, State } from "@/domain/types";
 import { FIELD_TYPES, STATES } from "@/domain/types";
 import { FIELD_TYPE_META } from "@/domain/fieldTypes";
@@ -58,10 +58,27 @@ export interface DefinitionEditorProps {
   /** Allowed field types (project fields exclude File). */
   fieldTypes?: readonly FieldType[];
   readOnly?: boolean;
-  /** Explains why the type can't be changed (e.g. system field). */
+  /** Explains why the type can't be changed (e.g. system field). Disables the type select. */
   typeLocked?: string;
+  /** A note under the type select that does not disable it (e.g. "can only switch between Dropdown and Multiple"). */
+  typeHint?: React.ReactNode;
+  /**
+   * When set, picking another field type first shows this effect ("what happens") with Change type / Cancel; the
+   * change is saved only after confirming. Without it the type is saved immediately (previous behaviour).
+   */
+  typeChangeEffect?: (to: FieldType) => React.ReactNode;
   nameLabel?: string;
+  /** Show the description box (default true; project fields have no description). */
+  withDescription?: boolean;
+  descriptionPlaceholder?: string;
+  /** Returns a message when a new name can't be used (e.g. another item already has it); the name is then not saved. */
+  validateName?: (name: string) => string | null;
 }
+
+/** Match the services' limits (names and choice labels, descriptions, units). */
+const NAME_MAX = 500;
+const DESCRIPTION_MAX = 500;
+const UNIT_MAX = 40;
 
 const STATE_SHORT: Record<State, string> = {
   NOT_STARTED: "NS",
@@ -87,12 +104,21 @@ export function DefinitionEditor({
   fieldTypes = FIELD_TYPES,
   readOnly,
   typeLocked,
+  typeHint,
+  typeChangeEffect,
   nameLabel = "Name",
+  withDescription = true,
+  descriptionPlaceholder = "Optional notes on what this milestone means",
+  validateName,
 }: DefinitionEditorProps) {
   const [name, setName] = useState(def.name);
+  const [nameError, setNameError] = useState<string | null>(null);
   const [description, setDescription] = useState(def.description);
   const [unit, setUnit] = useState(def.config.unit ?? "");
-  useEffect(() => setName(def.name), [def.name]);
+  useEffect(() => {
+    setName(def.name);
+    setNameError(null);
+  }, [def.name]);
   useEffect(() => setDescription(def.description), [def.description]);
   useEffect(() => setUnit(def.config.unit ?? ""), [def.config.unit]);
 
@@ -111,7 +137,20 @@ export function DefinitionEditor({
     [others, def.fieldType, baseline, meta.hasChoices, choicesChanged],
   );
 
+  const [pendingType, setPendingType] = useState<FieldType | null>(null);
+  useEffect(() => setPendingType(null), [def.fieldType]);
+
+  function pickType(t: FieldType) {
+    if (t === def.fieldType) {
+      setPendingType(null);
+      return;
+    }
+    if (typeChangeEffect) setPendingType(t);
+    else changeType(t);
+  }
+
   function changeType(t: FieldType) {
+    setPendingType(null);
     if (t === def.fieldType) return;
     const patch: DefPatch = { fieldType: t };
     // Dropdown choices need a state; give stateless choices "Not started" so they can be reviewed.
@@ -129,26 +168,49 @@ export function DefinitionEditor({
           id="def-name"
           value={name}
           disabled={readOnly}
-          onChange={(e) => setName(e.target.value)}
+          maxLength={NAME_MAX}
+          aria-invalid={nameError ? true : undefined}
+          aria-describedby={nameError ? "def-name-error" : undefined}
+          onChange={(e) => {
+            setName(e.target.value);
+            if (nameError) setNameError(null);
+          }}
           onBlur={() => {
-            const t = name.trim();
-            if (t && t !== def.name) onSave({ name: t });
-            else setName(def.name);
+            const t = name.trim().replace(/\s+/g, " ");
+            if (!t || t === def.name) {
+              setName(def.name);
+              setNameError(null);
+              return;
+            }
+            const problem = validateName?.(t) ?? null;
+            setNameError(problem);
+            if (!problem) onSave({ name: t });
           }}
           onKeyDown={(e) => {
             if (e.key === "Enter") (e.target as HTMLInputElement).blur();
+            else if (e.key === "Escape" && name !== def.name) {
+              // First Esc undoes the typing; the next one closes the panel.
+              e.preventDefault();
+              setName(def.name);
+              setNameError(null);
+            }
           }}
         />
+        {nameError ? (
+          <p id="def-name-error" role="alert" className="text-xs text-destructive">
+            {nameError}
+          </p>
+        ) : null}
       </div>
 
       <div className="space-y-1.5">
-        <Label>Field type</Label>
-        <Select value={def.fieldType} onValueChange={(v) => changeType(v as FieldType)} disabled={readOnly || Boolean(typeLocked)}>
-          <SelectTrigger className="h-8 w-full">
+        <Label htmlFor="def-type">Field type</Label>
+        <Select value={pendingType ?? def.fieldType} onValueChange={(v) => pickType(v as FieldType)} disabled={readOnly || Boolean(typeLocked)}>
+          <SelectTrigger id="def-type" className="h-8 w-full">
             <SelectValue />
           </SelectTrigger>
           <SelectContent>
-            {fieldTypes.map((t) => (
+            {(fieldTypes.includes(def.fieldType) ? fieldTypes : [def.fieldType, ...fieldTypes]).map((t) => (
               <SelectItem key={t} value={t}>
                 {FIELD_TYPE_META[t].label}
               </SelectItem>
@@ -156,6 +218,23 @@ export function DefinitionEditor({
           </SelectContent>
         </Select>
         {typeLocked ? <p className="text-xs text-muted-foreground">{typeLocked}</p> : null}
+        {!typeLocked && typeHint ? <p className="text-xs text-muted-foreground">{typeHint}</p> : null}
+        {pendingType && typeChangeEffect ? (
+          <div className="space-y-2 rounded-md border bg-muted/40 p-2.5" role="group" aria-label="Confirm field type change">
+            <div className="text-xs font-medium">
+              Change {FIELD_TYPE_META[def.fieldType].label} → {FIELD_TYPE_META[pendingType].label}?
+            </div>
+            {typeChangeEffect(pendingType)}
+            <div className="flex gap-2">
+              <Button size="sm" className="h-7" onClick={() => changeType(pendingType)}>
+                Change type
+              </Button>
+              <Button size="sm" variant="ghost" className="h-7" onClick={() => setPendingType(null)}>
+                Cancel
+              </Button>
+            </div>
+          </div>
+        ) : null}
       </div>
 
       {def.fieldType === "NUMBER" ? (
@@ -166,6 +245,7 @@ export function DefinitionEditor({
             value={unit}
             placeholder="e.g. pcs"
             disabled={readOnly}
+            maxLength={UNIT_MAX}
             onChange={(e) => setUnit(e.target.value)}
             onBlur={() => {
               const u = unit.trim();
@@ -190,21 +270,33 @@ export function DefinitionEditor({
         <ApplyToOthers twins={twins} onApply={onApplyChoicesTo} disabled={readOnly} />
       ) : null}
 
-      <div className="space-y-1.5">
-        <Label htmlFor="def-desc">Description</Label>
-        <Textarea
-          id="def-desc"
-          value={description}
-          disabled={readOnly}
-          rows={3}
-          placeholder="Optional notes on what this milestone means"
-          onChange={(e) => setDescription(e.target.value)}
-          onBlur={() => {
-            if (description.trim() !== def.description.trim()) onSave({ description: description.trim() });
-          }}
-          className="field-sizing-content min-h-16 text-sm"
-        />
-      </div>
+      {withDescription ? (
+        <div className="space-y-1.5">
+          <Label htmlFor="def-desc">Description</Label>
+          <Textarea
+            id="def-desc"
+            value={description}
+            disabled={readOnly}
+            rows={3}
+            maxLength={DESCRIPTION_MAX}
+            aria-describedby={description.length > DESCRIPTION_MAX - 100 ? "def-desc-count" : undefined}
+            placeholder={descriptionPlaceholder}
+            onChange={(e) => setDescription(e.target.value)}
+            onBlur={() => {
+              if (description.trim() !== def.description.trim()) onSave({ description: description.trim() });
+            }}
+            onKeyDown={(e) => {
+              if (e.key === "Enter" && (e.metaKey || e.ctrlKey)) (e.target as HTMLTextAreaElement).blur();
+            }}
+            className="field-sizing-content min-h-16 text-sm"
+          />
+          {description.length > DESCRIPTION_MAX - 100 ? (
+            <p id="def-desc-count" className="text-right text-xs text-muted-foreground tabular-nums">
+              {description.length} / {DESCRIPTION_MAX}
+            </p>
+          ) : null}
+        </div>
+      ) : null}
 
       {def.key ? (
         <div className="space-y-1">
@@ -233,6 +325,10 @@ function ChoicesEditor({
 }) {
   const [showArchived, setShowArchived] = useState(false);
   const [newLabel, setNewLabel] = useState("");
+  const [addError, setAddError] = useState<string | null>(null);
+  const [copyOpen, setCopyOpen] = useState(false);
+  const [copyQuery, setCopyQuery] = useState("");
+  const copyList = others.filter((o) => o.name.toLowerCase().includes(copyQuery.trim().toLowerCase()));
   const sensors = useSensors(useSensor(PointerSensor, { activationConstraint: { distance: 4 } }), useSensor(KeyboardSensor, { coordinateGetter: sortableKeyboardCoordinates }));
   const active = choices.filter((c) => !c.archived);
   const archived = choices.filter((c) => c.archived);
@@ -253,9 +349,17 @@ function ChoicesEditor({
     onChange([...arrayMove(active, from, to), ...archived]);
   }
   function add() {
-    const label = newLabel.trim();
+    const label = newLabel.trim().replace(/\s+/g, " ");
     if (!label) return;
-    if (active.some((c) => c.label.trim().toLowerCase() === label.toLowerCase())) {
+    const same = (c: Choice) => c.label.trim().toLowerCase() === label.toLowerCase();
+    if (active.some(same)) {
+      setAddError(`“${label}” is already a choice.`);
+      return;
+    }
+    const old = archived.find(same);
+    if (old) {
+      // Bring the archived choice back (same id, so values that use it still match) instead of adding a twin.
+      onChange([...active, { ...old, archived: undefined }, ...archived.filter((c) => c.id !== old.id)]);
       setNewLabel("");
       return;
     }
@@ -287,23 +391,48 @@ function ChoicesEditor({
         <Label>Choices</Label>
         <div className="flex items-center gap-1">
           {others.length && !readOnly ? (
-            <Popover>
+            <Popover
+              open={copyOpen}
+              onOpenChange={(o) => {
+                setCopyOpen(o);
+                if (!o) setCopyQuery("");
+              }}
+            >
               <PopoverTrigger asChild>
                 <Button variant="ghost" size="sm" className="h-7 text-xs">
                   <Copy className="size-3.5" /> Copy from…
                 </Button>
               </PopoverTrigger>
-              <PopoverContent className="max-h-72 w-72 overflow-y-auto p-1" align="end">
-                {others.map((o) => (
-                  <button
-                    key={o.id}
-                    type="button"
-                    className="block w-full truncate rounded px-2 py-1.5 text-left text-sm hover:bg-accent"
-                    onClick={() => copyFrom(o)}
-                  >
-                    {o.name} <span className="text-xs text-muted-foreground">({o.choices.filter((c) => !c.archived).length})</span>
-                  </button>
-                ))}
+              <PopoverContent className="w-72 p-1" align="end">
+                {others.length > 8 ? (
+                  <div className="relative mb-1">
+                    <Search aria-hidden className="pointer-events-none absolute top-1/2 left-2 size-3.5 -translate-y-1/2 text-muted-foreground" />
+                    <Input
+                      value={copyQuery}
+                      onChange={(e) => setCopyQuery(e.target.value)}
+                      placeholder="Find a list to copy"
+                      aria-label="Find a list to copy"
+                      className="h-7 pl-7 text-xs"
+                    />
+                  </div>
+                ) : null}
+                <div className="max-h-64 overflow-y-auto">
+                  {copyList.length === 0 ? <p className="px-2 py-1.5 text-xs text-muted-foreground">No match</p> : null}
+                  {copyList.map((o) => (
+                    <button
+                      key={o.id}
+                      type="button"
+                      className="block w-full truncate rounded px-2 py-1.5 text-left text-sm hover:bg-accent focus-visible:bg-accent focus-visible:outline-none"
+                      onClick={() => {
+                        copyFrom(o);
+                        setCopyOpen(false);
+                        setCopyQuery("");
+                      }}
+                    >
+                      {o.name} <span className="text-xs text-muted-foreground">({o.choices.filter((c) => !c.archived).length})</span>
+                    </button>
+                  ))}
+                </div>
               </PopoverContent>
             </Popover>
           ) : null}
@@ -330,22 +459,36 @@ function ChoicesEditor({
       </DndContext>
 
       {!readOnly ? (
-        <div className="flex gap-1">
-          <Input
-            value={newLabel}
-            onChange={(e) => setNewLabel(e.target.value)}
-            onKeyDown={(e) => {
-              if (e.key === "Enter") {
-                e.preventDefault();
-                add();
-              }
-            }}
-            placeholder="Add a choice and press Enter"
-            className="h-8"
-          />
-          <Button variant="outline" size="icon" className="size-8 shrink-0" onClick={add} aria-label="Add choice">
-            <Plus className="size-4" />
-          </Button>
+        <div className="space-y-1">
+          <div className="flex gap-1">
+            <Input
+              value={newLabel}
+              maxLength={NAME_MAX}
+              aria-label="New choice"
+              aria-invalid={addError ? true : undefined}
+              aria-describedby={addError ? "def-add-choice-error" : undefined}
+              onChange={(e) => {
+                setNewLabel(e.target.value);
+                if (addError) setAddError(null);
+              }}
+              onKeyDown={(e) => {
+                if (e.key === "Enter" && !e.nativeEvent.isComposing) {
+                  e.preventDefault();
+                  add();
+                }
+              }}
+              placeholder="Add a choice and press Enter"
+              className="h-8"
+            />
+            <Button variant="outline" size="icon" className="size-8 shrink-0" onClick={add} aria-label="Add choice">
+              <Plus className="size-4" />
+            </Button>
+          </div>
+          {addError ? (
+            <p id="def-add-choice-error" role="alert" className="text-xs text-destructive">
+              {addError}
+            </p>
+          ) : null}
         </div>
       ) : null}
 
@@ -416,6 +559,7 @@ function ChoiceRow({
       <Input
         value={label}
         disabled={readOnly}
+        maxLength={NAME_MAX}
         onChange={(e) => setLabel(e.target.value)}
         onBlur={() => {
           const t = label.trim();
@@ -466,7 +610,15 @@ function ChoiceRow({
 
 function ApplyToOthers({ twins, onApply, disabled }: { twins: OtherDef[]; onApply: (ids: string[]) => void; disabled?: boolean }) {
   const [selected, setSelected] = useState<Set<string>>(new Set());
-  useEffect(() => setSelected(new Set()), [twins]);
+  // Keep ticks across background refreshes; drop only milestones that are no longer listed.
+  const twinKey = twins.map((t) => t.id).join("|");
+  useEffect(() => {
+    const ids = new Set(twinKey.split("|"));
+    setSelected((prev) => {
+      const next = new Set([...prev].filter((id) => ids.has(id)));
+      return next.size === prev.size ? prev : next;
+    });
+  }, [twinKey]);
   return (
     <div className="rounded-md border bg-muted/40 p-2 text-xs">
       <div className="mb-1 font-medium">Also apply these choices to</div>

@@ -27,6 +27,7 @@ import { Slider } from "@/components/ui/slider";
 import { Calendar } from "@/components/ui/calendar";
 import { Popover, PopoverContent, PopoverTrigger } from "@/components/ui/popover";
 import { StateDot } from "@/components/state/state-badge";
+import { STATE_META } from "@/domain/state";
 
 export interface ValueEditorProps {
   def: FieldDef;
@@ -38,7 +39,13 @@ export interface ValueEditorProps {
   autoFocus?: boolean;
   /** Smaller layout for table cells / popovers. */
   compact?: boolean;
+  /** Shown when a Dropdown / Multiple has no choices (default: points to the Milestone Library). */
+  emptyChoicesHint?: React.ReactNode;
+  /** Accessible name of the input (screen readers), e.g. the milestone's name. Default: the field type. */
+  label?: string;
 }
+
+const DEFAULT_EMPTY_HINT = "No choices yet. Add them in the Milestone Library.";
 
 /** The right input for each field type. Every committed change calls onCommit once. */
 export function ValueEditor(props: ValueEditorProps) {
@@ -74,7 +81,7 @@ function visibleChoices(choices: Choice[], selected: Set<string>): Choice[] {
   return choices.filter((c) => !c.archived || selected.has(c.id));
 }
 
-function DropdownEditor({ def, value, onCommit, disabled, autoFocus, compact }: ValueEditorProps) {
+function DropdownEditor({ def, value, onCommit, disabled, autoFocus, compact, emptyChoicesHint, label }: ValueEditorProps) {
   const current = (value as DropdownValue | null)?.choiceId ?? null;
   const choices = visibleChoices(def.choices, new Set(current ? [current] : []));
   const ref = useRef<HTMLDivElement>(null);
@@ -91,9 +98,6 @@ function DropdownEditor({ def, value, onCommit, disabled, autoFocus, compact }: 
         e.preventDefault();
         onCommit({ choiceId: pick.id });
       }
-    } else if (e.key === "Backspace" || e.key === "Delete") {
-      e.preventDefault();
-      onCommit(null);
     }
   }
 
@@ -102,7 +106,7 @@ function DropdownEditor({ def, value, onCommit, disabled, autoFocus, compact }: 
       ref={ref}
       tabIndex={0}
       role="radiogroup"
-      aria-label={`Choose a value. Keys 1 to ${Math.min(9, choices.length)}`}
+      aria-label={`${label ? `${label}: choose` : "Choose"} a value. Keys 1 to ${Math.min(9, choices.length)}`}
       onKeyDown={onKeyDown}
       className="flex flex-col gap-1 rounded-md outline-none focus-visible:ring-2 focus-visible:ring-ring/50"
     >
@@ -114,6 +118,7 @@ function DropdownEditor({ def, value, onCommit, disabled, autoFocus, compact }: 
             type="button"
             role="radio"
             aria-checked={active}
+            aria-label={`${c.label}${c.archived ? " (retired)" : ""}, ${STATE_META[c.state ?? "NOT_STARTED"].label.toLowerCase()}`}
             disabled={disabled || (c.archived && !active)}
             onClick={() => onCommit(active ? null : { choiceId: c.id })}
             className={cn(
@@ -136,35 +141,48 @@ function DropdownEditor({ def, value, onCommit, disabled, autoFocus, compact }: 
           <X className="size-3.5" /> Clear
         </Button>
       ) : null}
-      {!choices.length ? <p className="text-xs text-muted-foreground">No choices yet. Add them in the Milestone Library.</p> : null}
+      {!choices.length ? <p className="text-xs text-muted-foreground">{emptyChoicesHint ?? DEFAULT_EMPTY_HINT}</p> : null}
     </div>
   );
 }
 
-function MultipleEditor({ def, value, onCommit, disabled }: ValueEditorProps) {
+function MultipleEditor({ def, value, onCommit, disabled, emptyChoicesHint, label }: ValueEditorProps) {
   const committed = useMemo(() => new Set((value as MultipleValue | null)?.choiceIds ?? []), [value]);
   const [local, setLocal] = useState<Set<string>>(committed);
   const timer = useRef<ReturnType<typeof setTimeout> | null>(null);
-  useEffect(() => setLocal(committed), [committed]);
+  // Toggles not sent yet (coalesced for 400 ms). Sent at once when the editor goes away (J/K, panel closed), never dropped.
+  const pending = useRef<Set<string> | null>(null);
+  const latest = useRef({ onCommit, choices: def.choices });
+  latest.current = { onCommit, choices: def.choices };
+  useEffect(() => {
+    if (!pending.current) setLocal(committed);
+  }, [committed]);
 
   const choices = visibleChoices(def.choices, local);
   const activeChoices = def.choices.filter((c) => !c.archived);
 
+  function flush() {
+    if (timer.current) clearTimeout(timer.current);
+    timer.current = null;
+    const next = pending.current;
+    pending.current = null;
+    if (!next) return;
+    const ids = latest.current.choices.map((c) => c.id).filter((id) => next.has(id));
+    latest.current.onCommit(ids.length ? { choiceIds: ids } : null);
+  }
   function schedule(next: Set<string>) {
     setLocal(next);
+    pending.current = next;
     if (timer.current) clearTimeout(timer.current);
-    timer.current = setTimeout(() => {
-      const ids = def.choices.map((c) => c.id).filter((id) => next.has(id));
-      onCommit(ids.length ? { choiceIds: ids } : null);
-    }, 400);
+    timer.current = setTimeout(flush, 400);
   }
-  useEffect(() => () => {
-    if (timer.current) clearTimeout(timer.current);
-  }, []);
+  useEffect(() => () => flush(), []);
+
+  if (!choices.length) return <p className="text-xs text-muted-foreground">{emptyChoicesHint ?? DEFAULT_EMPTY_HINT}</p>;
 
   return (
     <div className="space-y-2">
-      <div className="flex flex-wrap gap-1.5">
+      <div className="flex flex-wrap gap-1.5" role="group" aria-label={label ? `${label}: choose one or more` : "Choose one or more"}>
         {choices.map((c) => {
           const on = local.has(c.id);
           return (
@@ -213,6 +231,7 @@ export function DateField({
   disabled,
   autoFocus,
   label,
+  ariaLabel,
   placeholder = "e.g. 12 Nov 2026, today, +2w",
 }: {
   value: Ymd | undefined;
@@ -221,6 +240,8 @@ export function DateField({
   disabled?: boolean;
   autoFocus?: boolean;
   label?: string;
+  /** Accessible name of the input (default: the visible label, else "Date"). */
+  ariaLabel?: string;
   placeholder?: string;
 }) {
   const [text, setText] = useState(value ? formatYmd(value) : "");
@@ -253,6 +274,7 @@ export function DateField({
             }
           }}
           placeholder={placeholder}
+          aria-label={ariaLabel ?? label ?? "Date"}
           aria-invalid={invalid || undefined}
           disabled={disabled}
           autoFocus={autoFocus}
@@ -260,7 +282,7 @@ export function DateField({
         />
         <Popover open={open} onOpenChange={setOpen}>
           <PopoverTrigger asChild>
-            <Button variant="outline" size="icon" className="size-8 shrink-0" aria-label="Open calendar" disabled={disabled}>
+            <Button variant="outline" size="icon" className="size-8 shrink-0" aria-label={`Open calendar${ariaLabel ?? label ? ` for ${ariaLabel ?? label}` : ""}`} disabled={disabled}>
               <CalendarDays className="size-4" />
             </Button>
           </PopoverTrigger>
@@ -287,12 +309,12 @@ export function DateField({
   );
 }
 
-function DateEditor({ value, today, onCommit, disabled, autoFocus }: ValueEditorProps) {
+function DateEditor({ value, today, onCommit, disabled, autoFocus, label }: ValueEditorProps) {
   const current = (value as DateValue | null)?.date;
   const commit = (d: Ymd | undefined) => onCommit(d ? { date: d } : null);
   return (
     <div className="space-y-2">
-      <DateField value={current} today={today} onCommit={commit} disabled={disabled} autoFocus={autoFocus} />
+      <DateField value={current} today={today} onCommit={commit} disabled={disabled} autoFocus={autoFocus} ariaLabel={label ? `${label}: date` : "Date"} />
       <div className="flex flex-wrap gap-1">
         <Button variant="outline" size="sm" className="h-7" disabled={disabled} onClick={() => commit(today)}>
           Today
@@ -310,7 +332,7 @@ function DateEditor({ value, today, onCommit, disabled, autoFocus }: ValueEditor
   );
 }
 
-function DateRangeEditor({ value, today, onCommit, disabled, autoFocus }: ValueEditorProps) {
+function DateRangeEditor({ value, today, onCommit, disabled, autoFocus, label }: ValueEditorProps) {
   const v = (value as DateRangeValue | null) ?? {};
   function commit(next: DateRangeValue) {
     const clean: DateRangeValue = {};
@@ -321,14 +343,22 @@ function DateRangeEditor({ value, today, onCommit, disabled, autoFocus }: ValueE
   const reversed = Boolean(v.start && v.end && v.end < v.start);
   return (
     <div className="space-y-2">
-      <DateField label="Start" value={v.start} today={today} onCommit={(d) => commit({ ...v, start: d })} disabled={disabled} autoFocus={autoFocus} />
-      <DateField label="End" value={v.end} today={today} onCommit={(d) => commit({ ...v, end: d })} disabled={disabled} />
+      <DateField
+        label="Start"
+        ariaLabel={label ? `${label}: start date` : "Start date"}
+        value={v.start}
+        today={today}
+        onCommit={(d) => commit({ ...v, start: d })}
+        disabled={disabled}
+        autoFocus={autoFocus}
+      />
+      <DateField label="End" ariaLabel={label ? `${label}: end date` : "End date"} value={v.end} today={today} onCommit={(d) => commit({ ...v, end: d })} disabled={disabled} />
       {reversed ? <p className="text-xs text-destructive">The end date is before the start date.</p> : null}
     </div>
   );
 }
 
-function PercentEditor({ value, onCommit, disabled, autoFocus }: ValueEditorProps) {
+function PercentEditor({ value, onCommit, disabled, autoFocus, label }: ValueEditorProps) {
   const committed = (value as PercentValue | null)?.percent ?? 0;
   const [local, setLocal] = useState(committed);
   const [text, setText] = useState(String(committed));
@@ -340,7 +370,9 @@ function PercentEditor({ value, onCommit, disabled, autoFocus }: ValueEditorProp
     const clamped = Math.max(0, Math.min(100, Math.round(n)));
     setLocal(clamped);
     setText(String(clamped));
-    if (clamped !== committed || value === null) onCommit(clamped === 0 && value === null ? null : { percent: clamped });
+    // Leaving an empty value at 0 is not a change (no write, no History row).
+    if (value === null && clamped === 0) return;
+    if (clamped !== committed || value === null) onCommit({ percent: clamped });
   };
   return (
     <div className="space-y-3">
@@ -356,7 +388,7 @@ function PercentEditor({ value, onCommit, disabled, autoFocus }: ValueEditorProp
             setText(String(n));
           }}
           onValueCommit={([n]) => commit(n)}
-          aria-label="Percent complete"
+          aria-label={label ? `${label}: percent complete` : "Percent complete"}
         />
         <div className="flex items-center gap-1">
           <Input
@@ -370,7 +402,7 @@ function PercentEditor({ value, onCommit, disabled, autoFocus }: ValueEditorProp
             className="h-8 w-16 text-right tabular-nums"
             disabled={disabled}
             autoFocus={autoFocus}
-            aria-label="Percent"
+            aria-label={label ? `${label}: percent` : "Percent"}
           />
           <span className="text-sm text-muted-foreground">%</span>
         </div>
@@ -386,7 +418,7 @@ function PercentEditor({ value, onCommit, disabled, autoFocus }: ValueEditorProp
   );
 }
 
-function NumberEditor({ def, value, onCommit, disabled, autoFocus }: ValueEditorProps) {
+function NumberEditor({ def, value, onCommit, disabled, autoFocus, label }: ValueEditorProps) {
   const committed = (value as NumberValue | null)?.number;
   const [text, setText] = useState(committed === undefined ? "" : String(committed));
   useEffect(() => setText(committed === undefined ? "" : String(committed)), [committed]);
@@ -410,6 +442,7 @@ function NumberEditor({ def, value, onCommit, disabled, autoFocus }: ValueEditor
         onKeyDown={(e) => {
           if (e.key === "Enter") commit();
         }}
+        aria-label={`${label ?? "Number"}${def.config.unit ? ` (${def.config.unit})` : ""}`}
         aria-invalid={invalid || undefined}
         className="h-8 tabular-nums"
         disabled={disabled}
@@ -420,7 +453,7 @@ function NumberEditor({ def, value, onCommit, disabled, autoFocus }: ValueEditor
   );
 }
 
-function TextEditor({ value, onCommit, disabled, autoFocus }: ValueEditorProps) {
+function TextEditor({ value, onCommit, disabled, autoFocus, label }: ValueEditorProps) {
   const committed = (value as TextValue | null)?.text ?? "";
   const [text, setText] = useState(committed);
   useEffect(() => setText(committed), [committed]);
@@ -437,6 +470,7 @@ function TextEditor({ value, onCommit, disabled, autoFocus }: ValueEditorProps) 
         if (e.key === "Enter") commit();
         if (e.key === "Escape") setText(committed);
       }}
+      aria-label={label ?? "Text"}
       className="h-8"
       disabled={disabled}
       autoFocus={autoFocus}
@@ -444,7 +478,7 @@ function TextEditor({ value, onCommit, disabled, autoFocus }: ValueEditorProps) 
   );
 }
 
-function LongTextEditor({ value, onCommit, disabled, autoFocus }: ValueEditorProps) {
+function LongTextEditor({ value, onCommit, disabled, autoFocus, label }: ValueEditorProps) {
   const committed = (value as TextValue | null)?.text ?? "";
   const [text, setText] = useState(committed);
   useEffect(() => setText(committed), [committed]);
@@ -464,6 +498,7 @@ function LongTextEditor({ value, onCommit, disabled, autoFocus }: ValueEditorPro
           }
         }}
         rows={5}
+        aria-label={label ?? "Text"}
         className="field-sizing-content min-h-24 text-sm"
         disabled={disabled}
         autoFocus={autoFocus}
@@ -473,17 +508,23 @@ function LongTextEditor({ value, onCommit, disabled, autoFocus }: ValueEditorPro
   );
 }
 
-function CheckboxEditor({ value, onCommit, disabled, autoFocus }: ValueEditorProps) {
+function CheckboxEditor({ value, onCommit, disabled, autoFocus, label }: ValueEditorProps) {
   const on = Boolean((value as CheckboxValue | null)?.checked);
   return (
     <label className="flex items-center gap-2 text-sm">
-      <Switch checked={on} onCheckedChange={(c) => onCommit(c ? { checked: true } : null)} disabled={disabled} autoFocus={autoFocus} />
+      <Switch
+        checked={on}
+        onCheckedChange={(c) => onCommit(c ? { checked: true } : null)}
+        disabled={disabled}
+        autoFocus={autoFocus}
+        aria-label={label ?? undefined}
+      />
       {on ? "Yes" : "No"}
     </label>
   );
 }
 
-function LinkEditor({ value, onCommit, disabled, autoFocus }: ValueEditorProps) {
+function LinkEditor({ value, onCommit, disabled, autoFocus, label: fieldLabel }: ValueEditorProps) {
   const v = value as LinkValue | null;
   const [url, setUrl] = useState(v?.url ?? "");
   const [label, setLabel] = useState(v?.label ?? "");
@@ -513,6 +554,7 @@ function LinkEditor({ value, onCommit, disabled, autoFocus }: ValueEditorProps) 
             if (e.key === "Enter") commit();
           }}
           placeholder="https://…"
+          aria-label={fieldLabel ? `${fieldLabel}: link address` : "Link address"}
           aria-invalid={(Boolean(url.trim()) && !valid) || undefined}
           className="h-8"
           disabled={disabled}
@@ -531,6 +573,7 @@ function LinkEditor({ value, onCommit, disabled, autoFocus }: ValueEditorProps) 
         onChange={(e) => setLabel(e.target.value)}
         onBlur={commit}
         placeholder="Label (optional)"
+        aria-label={fieldLabel ? `${fieldLabel}: link label` : "Link label"}
         className="h-8"
         disabled={disabled}
       />
