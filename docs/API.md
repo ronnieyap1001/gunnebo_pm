@@ -31,15 +31,15 @@ Every service takes `ctx` first and throws `AppError(code, message, details?)`.
 **Project fields**
 - `listProjectFields(repo, {includeArchived?}?)`
 - `createProjectField(ctx, {label, fieldType, choices?, config?, showInSummary?})`
-- `updateProjectField(ctx, id, {label?, fieldType?, choices?, config?, showInSummary?, order?})`. A blocked type change throws VALIDATION with `details.blocking`.
+- `updateProjectField(ctx, id, {label?, fieldType?, choices?, config?, showInSummary?, order?}) → ProjectField & {mirrorsUpdated?, mirrorsNote?}`. A blocked type change throws VALIDATION with `details.blocking`. When the change alters the Notion Customer / Project type / Summary mirrors, up to 30 affected projects are rewritten; beyond that `mirrorsNote` says to run Repair mirrors.
 - `addProjectFieldChoice(ctx, fieldId, label) → {field, choiceId}`
-- `archiveProjectField(ctx, id)` (FORBIDDEN for system fields), `restoreProjectField(ctx, id)`
+- `archiveProjectField(ctx, id)` (FORBIDDEN for system fields), `restoreProjectField(ctx, id)` (VALIDATION when an active field already has its name)
 
 **Projects**
 - `startCreateProject(ctx, {code, name, status?, details?}) → {projectId, total}`
 - `continueCreateProject(ctx, opId) → {done, message, fraction, total, doneCount, projectId, created}`
 - `updateProject(ctx, id, {code?, name?, status?, details?}) → {project, changes}`
-- `archiveProject(ctx, id)`, `restoreProject(ctx, id)`, `reconcileProject(ctx, projectId) → {changed}`
+- `archiveProject(ctx, id)`, `restoreProject(ctx, id)`, `reconcileProject(ctx, projectId, {rewriteMirrors?}?) → {changed}`
 
 **Notes and attachments**
 - `addNote(ctx, {projectId, stepId?, body})`, `editNote(ctx, {projectId, noteId, body})`, `archiveNote(ctx, {projectId, noteId})`, `restoreNote(ctx, {projectId, noteId})`, all returning `Note`
@@ -62,7 +62,7 @@ Every service takes `ctx` first and throws `AppError(code, message, details?)`.
 - `getAppSettings(repo)`, `setTimeZone(ctx, tz)`, `setDisplayName(ctx, name)`, `recordBackup(ctx) → Iso`
 - `exportBackupPage(admin, database, cursor)`
 - `verifyHistoryPage(ctx, cursor, limit = 100) → {checked, mismatches, unhashed, nextCursor}`
-- `listProjectIdsForRepair(repo)`, `repairMirrorsBatch(ctx, ids (at most 5)) → {checked, repaired}`
+- `listProjectIdsForRepair(repo)`, `repairMirrorsBatch(ctx, ids (at most 5)) → {checked, repaired}` (also rewrites every checked project's Notion mirrors)
 - `startOver(admin, "RESET")`
 
 **Jobs and context**
@@ -76,7 +76,8 @@ Every service takes `ctx` first and throws `AppError(code, message, details?)`.
 - `getArchiveData({projectId?}?)`, `getCellDetails(stepId)`
 - `getStepHistory(stepId, cursor?, limit?)`, `getProjectHistory(projectId, {type?, source?}?, cursor?, limit?)`, `getAllHistory(filters?, cursor?, limit?)`, `getTemplateSnapshots(cursor?)`
 - `getSetupStatus()`, `getSettingsData()`, `getDay(now?)`, `getActionCtx({opId, source?, correlationId?, externalRef?})`
-- `TAGS = {library: 'library', projectFields: 'project-fields', settings: 'settings'}`
+- `TAGS = {library: 'library', projectFields: 'project-fields', settings: 'settings', schema: 'schema'}` (`schema`: the Notion schema registry, shared by all server instances)
+- `getSetupStatus()` also reports `errorKind`: `'tokenRejected'` (Notion refused NOTION_TOKEN) or `'busy'` (Notion busy or not answering)
 
 What changed for the UI: none of the signatures above changed. The batch id returned by an archive now equals the action's opId (keep using the returned value for Undo). A new arrow's id is `e:<opId>`. Use one opId per call. An invalid `position` or a `viewportWidth` outside 200–20,000 is ignored rather than stored.
 
@@ -84,7 +85,8 @@ What changed for the UI: none of the signatures above changed. The batch id retu
 ## Residual risks
 - **The browser must retry with the same opId.** With History written first, a failed action that is never retried leaves a row for a change that didn't land. The UI's write queue must retry failed writes with the original opId.
 - **Server Actions must catch `AppError`.** In production, Next masks errors thrown from Server Actions, so the actions need to catch it and return `{code, message, details}`.
-- **Notion query lag.** All retry checks (`hasOp`, stepKey, `findByCode`, orphan adoption) read through Notion queries, which can lag a fresh write by a few seconds. A very fast retry could still duplicate.
+- **Notion query lag.** Jobs (create project, sync, import) record the id of every row they create and save it after every batch, read their job row by page id, and read steps the query does not show yet by id; reconcile and attachment counts do the same. Single-action retry checks (`hasOp`, stepKey of `addProjectStep`, `findByCode`, orphan adoption) still read through Notion queries, which can lag a fresh write by a few seconds, so a very fast retry could still duplicate. A crash between a job's create and its save can leave a second copy: finalize (and, for steps, reconcile) moves untouched copies to Notion's trash once the query shows them.
+- **Waits under lag.** `continue…` with an opId whose job row is not visible yet retries the lookup 4 times, 2 s apart (about 8 s before NOT_FOUND). A job save that Notion answers with a 5xx, a timeout or a dropped connection is sent once more. After an import create that failed, finalize waits up to 10 s (at most 8 waiting calls) so a copy Notion did save shows in the query and goes to the trash.
 - **Step writes after a crash.** A crash between the step write and the History append still gives a `resumed` row without the old value.
 - **Orphan adoption is a heuristic.** It looks back 15 minutes and at the newest 100 History rows of that type.
 - **Settings growth and size.** Finished-job records pile up in Settings. Job plans and template snapshots are bounded by Notion's ~200 KB text limit, so importing a file near the 1 MB maximum would fail to save its job.

@@ -39,6 +39,7 @@ import { hasChoices, prepareChoices, prepareConfig, requireFieldType, typeLabel,
 import { edgeError, isPosition, MAX_DESCRIPTION_LENGTH, orderAfter, viewportWidthOf } from "./library";
 import {
   cellFlowOrder,
+  currentMirror,
   defOf,
   stepMirrorsOf,
   stepState,
@@ -48,7 +49,7 @@ import {
   type CellsProgress,
 } from "./mirrors";
 import { buildCell } from "@/domain/cells";
-import { assertNoNewRetiredChoice, requireProject, settleAll } from "./projects";
+import { assertNoNewRetiredChoice, requireProject, settleAll, withKnownSteps } from "./projects";
 
 /** Most steps per bulk call (the UI splits bigger selections into several calls, each with its own opId). */
 export const BULK_LIMIT = 16;
@@ -706,8 +707,9 @@ export async function moveProjectNodes(ctx: Ctx, projectId: string, positions: R
   if (changed) await ctx.repo.projects.update(projectId, { flow: { nodes, edges: project.flow.edges } });
 }
 
-async function activeStepsById(ctx: Ctx, projectId: string): Promise<Map<string, StoredStep>> {
-  const steps = await ctx.repo.steps.listByProject(projectId);
+/** The project's active steps by id; `ids` the query does not show yet (added moments ago) are read by id. */
+async function activeStepsById(ctx: Ctx, project: Project, ids: string[] = []): Promise<Map<string, StoredStep>> {
+  const steps = await withKnownSteps(ctx.repo, project, await ctx.repo.steps.listByProject(project.id), ids);
   return new Map(steps.map((s) => [s.id, s]));
 }
 
@@ -723,7 +725,7 @@ function opEdgeIds(ctx: Ctx, flow: Flow): () => string {
  */
 export async function addProjectEdge(ctx: Ctx, projectId: string, from: string, to: string): Promise<FlowEdge> {
   const project = await requireProject(ctx.repo, projectId);
-  const steps = await activeStepsById(ctx, projectId);
+  const steps = await activeStepsById(ctx, project, [from, to]);
   const a = steps.get(from);
   const b = steps.get(to);
   if (!a || !b) throw notFound("One end of the arrow");
@@ -740,7 +742,8 @@ export async function addProjectEdge(ctx: Ctx, projectId: string, from: string, 
     projectId,
     data: { edgeId: r.edge.id, from, to, fromName: a.name, toName: b.name },
   });
-  await ctx.repo.projects.update(projectId, { flow: r.flow });
+  // An arrow changes which milestones are current: the Notion "Current" mirror follows the flow.
+  await ctx.repo.projects.update(projectId, { flow: r.flow, mirrors: { current: currentMirror(project.cells ?? {}, r.flow, ctx.day) } });
   return r.edge;
 }
 
@@ -758,7 +761,8 @@ export async function archiveProjectEdge(ctx: Ctx, projectId: string, edgeId: st
     projectId,
     data: { edgeId, from: edge.from, to: edge.to, fromName: name(edge.from), toName: name(edge.to) },
   });
-  await ctx.repo.projects.update(projectId, { flow: archiveEdge(project.flow, edgeId, ctx.now, "USER") });
+  const flow = archiveEdge(project.flow, edgeId, ctx.now, "USER");
+  await ctx.repo.projects.update(projectId, { flow, mirrors: { current: currentMirror(project.cells ?? {}, flow, ctx.day) } });
 }
 
 /** Auto-layout of the project's active steps. No History. */

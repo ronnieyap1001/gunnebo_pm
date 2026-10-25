@@ -211,8 +211,10 @@ export function FieldsTab({
       queue: QUEUE.fields,
       optimistic: () => apply({ type: "patch", id: row.id, patch: optimistic }),
       run: (opId) => updateProjectFieldAction(opId, row.id, patch),
-      onSuccess: () => {
+      onSuccess: (data) => {
         if (patch.fieldType) setBlocks(({ [row.id]: _gone, ...rest }) => rest);
+        // Too many projects to refresh their Notion copies now: tell the user how to do it.
+        if (data.mirrorsNote) toast.info(data.mirrorsNote);
       },
       onFailure: (f) => {
         const blocking = blockingOf(f);

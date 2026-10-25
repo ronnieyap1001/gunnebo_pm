@@ -11,7 +11,10 @@
  *   (bulk actions log one row relating to many steps);
  * - attachments: `openFile` returns a data: URL; files above 4 MB are refused.
  *
- * Test helpers: `writeCount()` counts every create/update/set/append; `beforeWrite` can throw to simulate a crash.
+ * - `discard` (a second copy a retried batch created) moves the row to `store.trash`: no list or get returns it again.
+ *
+ * Test helpers: `writeCount()` counts every create/update/set/append/discard; `beforeWrite` can throw to simulate a
+ * crash.
  */
 import { randomUUID } from "node:crypto";
 import type {
@@ -60,6 +63,8 @@ export interface MemoryRepo extends Repo {
     attachments: Map<string, Attachment & { bytes?: string }>;
     /** Last write-only mirrors per project / step id. */
     mirrors: Map<string, unknown>;
+    /** Rows removed with `discard` (Notion's trash), by id. */
+    trash: Map<string, unknown>;
   };
 }
 
@@ -114,7 +119,15 @@ export function createMemoryRepo(opts: MemoryRepoOptions = {}): MemoryRepo {
     notes: new Map(),
     attachments: new Map(),
     mirrors: new Map(),
+    trash: new Map(),
   };
+
+  function discardFrom<T>(map: Map<string, T>, id: string): void {
+    const row = map.get(id);
+    if (row === undefined) return;
+    map.delete(id);
+    store.trash.set(id, row);
+  }
 
   const repo: MemoryRepo = {
     beforeWrite: null,
@@ -158,6 +171,10 @@ export function createMemoryRepo(opts: MemoryRepoOptions = {}): MemoryRepo {
         store.milestones.set(id, next);
         return json(next);
       },
+      async discard(id) {
+        write("milestones.discard");
+        discardFrom(store.milestones, id);
+      },
     },
 
     projectFields: {
@@ -177,6 +194,10 @@ export function createMemoryRepo(opts: MemoryRepoOptions = {}): MemoryRepo {
         const next = { ...applyPatch(row, patch), id };
         store.projectFields.set(id, next);
         return json(next);
+      },
+      async discard(id) {
+        write("projectFields.discard");
+        discardFrom(store.projectFields, id);
       },
     },
 
@@ -234,6 +255,10 @@ export function createMemoryRepo(opts: MemoryRepoOptions = {}): MemoryRepo {
         const next = { ...applyPatch(row, stripMirrors(patch, store.mirrors, id)), id, updatedAt: clock() };
         store.steps.set(id, next);
         return json(next);
+      },
+      async discard(id) {
+        write("steps.discard");
+        discardFrom(store.steps, id);
       },
     },
 

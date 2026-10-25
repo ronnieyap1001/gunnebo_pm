@@ -110,7 +110,11 @@ export interface FileDownload {
 
 export interface Repo {
   settings: {
-    get<T = unknown>(key: string): Promise<T | undefined>;
+    /**
+     * `fresh`: the value as Notion has it now. A row found through a query is read again by its page id (a query can
+     * return an older copy, or miss a row written moments ago by another server instance).
+     */
+    get<T = unknown>(key: string, opts?: { fresh?: boolean }): Promise<T | undefined>;
     set(key: string, value: unknown): Promise<void>;
     /** All settings whose key starts with `prefix` (all when omitted). */
     list(prefix?: string): Promise<Record<string, unknown>>;
@@ -121,12 +125,16 @@ export interface Repo {
     get(id: string): Promise<Milestone | null>;
     create(input: MilestoneInput): Promise<Milestone>;
     update(id: string, patch: Partial<MilestoneInput>): Promise<Milestone>;
+    /** Removes a second copy a retried batch created (see `steps.discard`). */
+    discard(id: string): Promise<void>;
   };
 
   projectFields: {
     list(opts?: ListOpts): Promise<ProjectField[]>;
     create(input: ProjectFieldInput): Promise<ProjectField>;
     update(id: string, patch: Partial<ProjectFieldInput>): Promise<ProjectField>;
+    /** Removes a second copy a retried batch created (see `steps.discard`). */
+    discard(id: string): Promise<void>;
   };
 
   projects: {
@@ -144,6 +152,11 @@ export interface Repo {
     get(id: string): Promise<StoredStep | null>;
     create(input: StepInput): Promise<StoredStep>;
     update(id: string, patch: Partial<StepInput>): Promise<StoredStep>;
+    /**
+     * Removes a second copy of a row that a retried batch created because a lagging query did not show the first
+     * one. Never a hard delete: Notion keeps it in its trash for 30 days. The app never lists or reads it again.
+     */
+    discard(id: string): Promise<void>;
   };
 
   history: {
@@ -191,6 +204,11 @@ export interface SetupStatus {
   schemaReady: boolean;
   /** Settings key 'seed.appliedAt' is present. */
   seeded: boolean;
+  /**
+   * Why Notion could not be read: 'tokenRejected' (Notion refused NOTION_TOKEN) or 'busy' (Notion was busy or did not
+   * answer; try again). Undefined when Notion answered.
+   */
+  errorKind?: "tokenRejected" | "busy";
 }
 
 export interface SetupStepResult {

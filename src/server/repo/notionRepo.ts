@@ -653,8 +653,11 @@ export function createNotionRepo(notion: NotionLike, registry: RegistryHandle | 
     }
   }
 
-  /** The Settings row for `key`: by the id this instance remembers, else the oldest row whose Key is exactly `key`. */
-  async function settingRow(e: DbEntry, key: string): Promise<PageObjectResponse | null> {
+  /**
+   * The Settings row for `key`: by the id this instance remembers, else the oldest row whose Key is exactly `key`.
+   * `fresh`: a row found through the query is read again by its page id (the query may return an older copy).
+   */
+  async function settingRow(e: DbEntry, key: string, fresh = false): Promise<PageObjectResponse | null> {
     const known = settingIds.get(key);
     if (known) {
       const p = await getPage(e, known);
@@ -665,8 +668,29 @@ export function createNotionRepo(notion: NotionLike, registry: RegistryHandle | 
     if (row) {
       remember(row);
       settingIds.set(key, row.id);
+      if (fresh) {
+        const p = await getPage(e, row.id);
+        if (p && new Row(p, e).text("key") === key) return p;
+      }
     }
     return row;
+  }
+
+  /** Moves a page of this data source to Notion's trash (recoverable there for 30 days). Already gone: nothing to do. */
+  async function discardPage(e: DbEntry, id: string): Promise<void> {
+    const pid = extractNotionId(id);
+    if (!pid) return;
+    let p: Awaited<ReturnType<NotionLike["pages"]["retrieve"]>>;
+    try {
+      p = await notion.pages.retrieve({ page_id: pid, filter_properties: ["title"] });
+    } catch (err) {
+      if (isNotionCode(err, "object_not_found") || isNotionCode(err, "validation_error")) return;
+      throw err;
+    }
+    if (!isFullPage(p) || p.in_trash) return;
+    remember(p);
+    if (!inDataSource(p, e)) throw new NotSharedError("This item belongs to a different Notion database.");
+    await notion.pages.update({ page_id: pid, in_trash: true });
   }
 
   function relContains(e: DbEntry, pk: string, id: string): FilterItem {
@@ -997,10 +1021,10 @@ export function createNotionRepo(notion: NotionLike, registry: RegistryHandle | 
   // -- the Repo ----------------------------------------------------------------------
   const repo: Repo = {
     settings: {
-      get: <T = unknown>(key: string) =>
+      get: <T = unknown>(key: string, opts?: { fresh?: boolean }) =>
         call(async (reg) => {
           const e = entry(reg, "settings");
-          const row = await settingRow(e, key);
+          const row = await settingRow(e, key, opts?.fresh === true);
           if (!row) return undefined;
           return new Row(row, e).json<T | undefined>("value", undefined);
         }),
@@ -1072,6 +1096,7 @@ export function createNotionRepo(notion: NotionLike, registry: RegistryHandle | 
           const e = entry(reg, "milestones");
           return toMilestone(new Row(await updatePage(e, id, milestoneWrites(e, patch)), e));
         }),
+      discard: (id) => call((reg) => discardPage(entry(reg, "milestones"), id)),
     },
 
     projectFields: {
@@ -1094,6 +1119,7 @@ export function createNotionRepo(notion: NotionLike, registry: RegistryHandle | 
           const e = entry(reg, "projectFields");
           return toProjectField(new Row(await updatePage(e, id, projectFieldWrites(e, patch)), e));
         }),
+      discard: (id) => call((reg) => discardPage(entry(reg, "projectFields"), id)),
     },
 
     projects: {
@@ -1182,6 +1208,7 @@ export function createNotionRepo(notion: NotionLike, registry: RegistryHandle | 
           const e = entry(reg, "steps");
           return toStep(new Row(await updatePage(e, id, stepWrites(e, patch)), e));
         }),
+      discard: (id) => call((reg) => discardPage(entry(reg, "steps"), id)),
     },
 
     history: {

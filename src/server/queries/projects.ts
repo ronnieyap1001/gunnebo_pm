@@ -29,7 +29,7 @@ import { isEmptyValue } from "@/domain/values";
 import type { Repo, StoredStep } from "@/server/repo/types";
 import { attachmentCounts, cellFlowOrder, currentOfCells, defOf, progressOfCells, stepState, type ProgressInfo } from "@/server/services/mirrors";
 import { PROJECT_CLOSED_KEY } from "@/server/services/steps";
-import { PROJECT_STATUS_LABELS } from "@/server/services/projects";
+import { PROJECT_STATUS_LABELS, withKnownSteps } from "@/server/services/projects";
 import { decoratePlan } from "@/server/services/sync";
 import {
   attachmentDTO,
@@ -362,13 +362,15 @@ export function buildProjectPage(input: {
 export async function getProjectPageData(repo: Repo, day: DayContext, id: string, deps?: ReadDeps): Promise<ProjectPageData | null> {
   const project = await repo.projects.get(id);
   if (!project) return null;
-  const [steps, notes, attachments, fields, template] = await Promise.all([
+  const [listed, notes, attachments, fields, template] = await Promise.all([
     repo.steps.listByProject(id, { includeArchived: true }),
     repo.notes.listByProject(id),
     repo.attachments.listByProject(id),
     projectFieldsOf(repo, deps),
     templateOf(repo, deps),
   ]);
+  // Notion's query can lag a few seconds behind a write: read a just-added step by id so it shows straight away.
+  const steps = await withKnownSteps(repo, project, listed);
   return buildProjectPage({ project, steps, notes, attachments, fields, template, day });
 }
 

@@ -21,7 +21,7 @@ import {
   type VerifyHistoryResult,
 } from "@/server/services";
 
-const ALL_TAGS = [TAGS.library, TAGS.projectFields, TAGS.settings];
+const ALL_TAGS = [TAGS.library, TAGS.projectFields, TAGS.settings, TAGS.schema];
 const text = (max: number) => z.string().max(max);
 // Storage cursors can be long (the backup cursor carries the ids already read at the same timestamp).
 const cursorSchema = z.string().max(1_500_000).nullable();

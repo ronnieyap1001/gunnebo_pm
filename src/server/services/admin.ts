@@ -18,6 +18,7 @@ import {
 } from "./context";
 import { historyHash } from "./historyHash";
 import { readTemplateRevision } from "./library";
+import { listProjectFields } from "./projectFields";
 import { reconcileProject } from "./projects";
 
 export interface AppSettings {
@@ -134,13 +135,19 @@ export async function listProjectIdsForRepair(repo: Repo): Promise<string[]> {
   return projects.filter((p) => p.setup === "READY").map((p) => p.id).sort();
 }
 
-/** "Repair mirrors": reconciles each given project (at most 5 per call). */
+/**
+ * "Repair mirrors": reconciles each given project (at most 5 per call) and rewrites its Notion mirrors (Current,
+ * Customer, Project type, Summary) whether or not the cells changed. `repaired` lists the projects whose cells or
+ * progress were wrong.
+ */
 export async function repairMirrorsBatch(ctx: Ctx, projectIds: string[]): Promise<{ checked: number; repaired: string[] }> {
   const ids = [...new Set(projectIds)];
   if (ids.length > 5) throw new AppError("VALIDATION", "Repair at most 5 projects per call.");
+  if (ids.length === 0) return { checked: 0, repaired: [] };
+  const fields = await listProjectFields(ctx.repo, { includeArchived: true });
   const repaired: string[] = [];
   for (const id of ids) {
-    const r = await reconcileProject(ctx, id);
+    const r = await reconcileProject(ctx, id, { rewriteMirrors: { fields } });
     if (r.changed) repaired.push(id);
   }
   return { checked: ids.length, repaired };

@@ -35,12 +35,18 @@ function cleanName(raw: unknown, fallback: string): string {
 
 /**
  * After an attachment change: re-count the step's active attachments, replace its cell, and (for FILE steps) set
- * stateChangedAt when the state flipped.
+ * stateChangedAt and the step's Notion mirrors when the state flipped.
+ *
+ * `changed` is the attachment just written: it is counted as it is now (added, archived or restored), whatever the
+ * Files query returns, because the query can lag behind the write (miss a link added moments ago, or still list one
+ * removed moments ago).
  */
-async function refreshStep(ctx: Ctx, project: Project, stepId: string | undefined): Promise<CellsProgress> {
+async function refreshStep(ctx: Ctx, project: Project, stepId: string | undefined, changed: Attachment): Promise<CellsProgress> {
   if (!stepId) return { progress: project.progress, cells: project.cells ?? {} };
-  const [step, atts] = await Promise.all([ctx.repo.steps.get(stepId), ctx.repo.attachments.listByProject(project.id)]);
+  const [step, listed] = await Promise.all([ctx.repo.steps.get(stepId), ctx.repo.attachments.listByProject(project.id)]);
   if (!step || step.archived) return { progress: project.progress, cells: project.cells ?? {} };
+  const atts = listed.filter((a) => a.id !== changed.id);
+  if (!changed.archived) atts.push(changed);
   const count = attachmentCounts(atts)[stepId] ?? 0;
   const before = project.cells?.[stepId]?.fc ?? 0;
   let current = step;
@@ -75,7 +81,7 @@ export async function addLink(
   const same = atts.filter((a) => a.kind === "LINK" && a.url === url && (a.stepId ?? undefined) === (input.stepId ?? undefined));
   if (await alreadyLogged(ctx)) {
     const done = same.pop();
-    if (done) return { attachment: done, project: await refreshStep(ctx, project, input.stepId) };
+    if (done) return { attachment: done, project: await refreshStep(ctx, project, input.stepId, done) };
   }
   // A retry after a crash between the link and its History row adopts the link the first attempt created.
   const attachment =
@@ -86,7 +92,7 @@ export async function addLink(
       name,
       url,
     }));
-  const mirrors = await refreshStep(ctx, project, input.stepId);
+  const mirrors = await refreshStep(ctx, project, input.stepId, attachment);
   await appendHistory(ctx, {
     type: EV.attachmentAdded,
     summary: summaryFor(project.code, `Link "${name}" added ${label(step?.name)}`),
@@ -118,7 +124,7 @@ export async function addFile(
   );
   if (await alreadyLogged(ctx)) {
     const done = same.pop();
-    if (done) return { attachment: done, project: await refreshStep(ctx, project, input.stepId) };
+    if (done) return { attachment: done, project: await refreshStep(ctx, project, input.stepId, done) };
   }
   // A retry after a crash between the upload and its History row adopts the file instead of uploading it again.
   const attachment =
@@ -131,7 +137,7 @@ export async function addFile(
       size,
       data: input.data,
     }));
-  const mirrors = await refreshStep(ctx, project, input.stepId);
+  const mirrors = await refreshStep(ctx, project, input.stepId, attachment);
   await appendHistory(ctx, {
     type: EV.attachmentAdded,
     summary: summaryFor(project.code, `File "${name}" added ${label(step?.name)}`),
@@ -165,7 +171,7 @@ async function requireAttachment(ctx: Ctx, id: string): Promise<Attachment> {
 async function setArchived(ctx: Ctx, id: string, archived: boolean): Promise<AttachmentWriteResult> {
   const a = await requireAttachment(ctx, id);
   const project = await requireProject(ctx.repo, a.projectId);
-  if (a.archived === archived) return { attachment: a, project: await refreshStep(ctx, project, a.stepId) };
+  if (a.archived === archived) return { attachment: a, project: await refreshStep(ctx, project, a.stepId, a) };
   const step = await stepOf(ctx, project, a.stepId).catch(() => undefined);
   const what = a.kind === "LINK" ? "Link" : "File";
   await appendHistory(ctx, {
@@ -179,7 +185,7 @@ async function setArchived(ctx: Ctx, id: string, archived: boolean): Promise<Att
     data: { attachmentId: a.id, kind: a.kind, name: a.name, url: a.url, stepName: step?.name, milestoneKey: step?.milestoneKey },
   });
   const attachment = await ctx.repo.attachments.update(id, archived ? { archived: true, archivedAt: ctx.now } : { archived: false });
-  return { attachment, project: await refreshStep(ctx, project, a.stepId) };
+  return { attachment, project: await refreshStep(ctx, project, a.stepId, attachment) };
 }
 
 /** Removing an attachment archives it; the file stays in storage. History `attachment.archived`. */

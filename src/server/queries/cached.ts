@@ -5,12 +5,19 @@ import "server-only";
  * Library/template, project fields and settings are cached with unstable_cache (tags in ./tags, revalidate 60 s);
  * projects, steps, notes, attachments and History are always read fresh. Server Components call these; Server
  * Actions call `updateTag(TAGS.x)` after writes and build their context with `getActionCtx`.
+ *
+ * The Notion schema registry (database and property ids, about 20 Notion requests to discover) is shared by every
+ * server instance through unstable_cache (tag 'schema', revalidate 1 h); see shareSchemaRegistry below.
  */
-import { unstable_cache } from "next/cache";
+import { createHash } from "node:crypto";
+import { revalidateTag, unstable_cache } from "next/cache";
 import { after } from "next/server";
 import { todayIn } from "@/domain/dates";
 import type { DayContext, EventSource, ProjectField, Template } from "@/domain/types";
-import { getRepo, getStorageAdmin } from "@/server/repo";
+import { fakeNotionFile, getNotion, storageMode } from "@/server/notion/client";
+import { discoverShareableRegistry, parentTitleFor } from "@/server/notion/registry";
+import { SCHEMA_VERSION } from "@/server/notion/schema";
+import { getRepo, getStorageAdmin, setRegistryLoader } from "@/server/repo";
 import { getAppSettings, type AppSettings } from "@/server/services/admin";
 import { makeCtx, type Ctx } from "@/server/services/context";
 import { getTemplate } from "@/server/services/library";
@@ -23,7 +30,35 @@ import * as libraryQ from "./library";
 import * as portfolioQ from "./portfolio";
 import * as projectsQ from "./projects";
 import * as setupQ from "./setup";
-import { CACHE_REVALIDATE_SECONDS, TAGS } from "./tags";
+import { CACHE_REVALIDATE_SECONDS, SCHEMA_REVALIDATE_SECONDS, TAGS } from "./tags";
+
+/**
+ * One schema discovery for all server instances: a cold instance reads the registry from Next's data cache instead
+ * of making ~20 Notion requests, and "Check again", "Reload from Notion", Setup and "Start over" (which revalidate the
+ * 'schema' tag) reach every instance. Only a ready registry is cached (discoverShareableRegistry throws any other one
+ * back to the instance that asked); when the data cache is unavailable the repo discovers directly. The key names the
+ * environment, the parent page setting and the token (hashed), and with local test data the data file, so another
+ * workspace, page or test file never reuses an entry.
+ */
+function shareSchemaRegistry(): void {
+  const env = process.env;
+  const mode = storageMode(env);
+  const tokenHash = env.NOTION_TOKEN ? createHash("sha256").update(env.NOTION_TOKEN).digest("hex").slice(0, 16) : "none";
+  const fakeFile = mode === "fake" ? (fakeNotionFile(env) ?? ":memory:") : "";
+  const loader = unstable_cache(
+    async () => discoverShareableRegistry(getNotion()),
+    ["gpm", TAGS.schema, String(SCHEMA_VERSION), mode, parentTitleFor(env), env.NOTION_PARENT_PAGE_ID ?? "", tokenHash, fakeFile],
+    { tags: [TAGS.schema], revalidate: SCHEMA_REVALIDATE_SECONDS },
+  );
+  setRegistryLoader(loader, () => {
+    try {
+      revalidateTag(TAGS.schema, { expire: 0 });
+    } catch {
+      // Not allowed while rendering: this instance rediscovers directly; the shared entry expires on its own.
+    }
+  });
+}
+shareSchemaRegistry();
 
 export const getCachedTemplate: () => Promise<Template> = unstable_cache(async () => getTemplate(getRepo()), ["gpm", "template"], {
   tags: [TAGS.library],

@@ -164,12 +164,16 @@ export async function createProjectFieldAction(opId: string, input: unknown): Pr
   );
 }
 
-export async function updateProjectFieldAction(opId: string, id: unknown, patch: unknown): Promise<ActionResult<{ id: string }>> {
+export async function updateProjectFieldAction(
+  opId: string,
+  id: unknown,
+  patch: unknown,
+): Promise<ActionResult<{ id: string; mirrorsNote?: string }>> {
   return runAction(
     opId,
     async (ctx) => {
       const f = await updateProjectField(ctx, parse(Id, id), parse(FieldPatchSchema, patch));
-      return { id: f.id };
+      return f.mirrorsNote ? { id: f.id, mirrorsNote: f.mirrorsNote } : { id: f.id };
     },
     FIELDS,
   );

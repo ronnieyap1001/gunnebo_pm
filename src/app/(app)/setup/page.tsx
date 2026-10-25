@@ -1,3 +1,4 @@
+import { requireUser } from "@/server/auth/session";
 import { PageHeader } from "@/components/shell/page-header";
 import { SetupScreen } from "@/components/admin/setup-screen";
 import { describeOpenJobs, readSetupStatus, timeZoneOrDefault } from "./status";
@@ -7,6 +8,7 @@ export const metadata = { title: "Setup" };
 
 /** Never calls requireReadyStorage: this is where the app sends people until Notion is ready. */
 export default async function Page({ searchParams }: { searchParams: Promise<Record<string, string | string[] | undefined>> }) {
+  await requireUser();
   const sp = await searchParams;
   const status = await readSetupStatus();
   let jobProjects: Record<string, string> = {};

@@ -7,6 +7,7 @@ import { buildProjectSnapshot, remapFlow, type StepDraft } from "@/domain/snapsh
 import { stableStringify } from "@/domain/syncPlan";
 import {
   PROJECT_STATUSES,
+  type Attachment,
   type Choice,
   type DropdownValue,
   type MultipleValue,
@@ -31,8 +32,10 @@ import {
   finishJob,
   isFinished,
   loadJob,
+  loadJobForContinue,
   newJob,
   saveJob,
+  settleSome,
   stepResult,
   type JobBase,
   type JobStepResult,
@@ -152,6 +155,11 @@ export interface CreateProjectJob extends JobBase<"createProject"> {
   revision: number;
   /** The Project row to create, so a retry after a crash before the row existed can still create it. */
   row?: ProjectInput;
+  /**
+   * tempId → id of the step created for it, saved after every batch. The next batch counts these as done instead of
+   * looking for them with a query that may not show them yet (and would create them a second time).
+   */
+  created?: Record<string, string>;
 }
 
 export function stepKeyOf(projectId: string, tempId: string): string {
@@ -241,12 +249,15 @@ export interface CreateProgress extends JobStepResult {
 }
 
 /**
- * Creates up to 8 missing steps per call (stepKey = `<projectId>:<tempId>`, so a resumed batch never duplicates).
- * When all exist: remaps the flow to step ids, builds cells, sets setup READY and progress, writes ONE History row
- * `project.created` { revision, nodeCount, edgeCount } and clears the job. Calling again after done is a no-op.
+ * Creates up to 8 missing steps per call. The job records each created step's id (tempId → step id) and is saved
+ * after every batch, so a lagging query never makes a later batch create a step twice; stepKey
+ * (`<projectId>:<tempId>`) finds steps a crashed batch created before it could record them.
+ * When all exist: remaps the flow to the recorded step ids, builds cells, sets setup READY and progress, moves any
+ * second copy of a step to Notion's trash, writes ONE History row `project.created` { revision, nodeCount, edgeCount }
+ * and clears the job. Calling again after done is a no-op.
  */
 export async function continueCreateProject(ctx: Ctx, opId: string): Promise<CreateProgress> {
-  const job = await loadJob<CreateProjectJob>(ctx.repo, opId);
+  const job = await loadJobForContinue<CreateProjectJob>(ctx.repo, opId);
   if (!job || job.kind !== "createProject") throw new AppError("NOT_FOUND", "This project setup was not found. Start again.");
   if (isFinished(job)) {
     return { ...stepResult(true, job.total, job.total, "Project ready"), projectId: job.projectId ?? "", created: job.total };
@@ -254,33 +265,70 @@ export async function continueCreateProject(ctx: Ctx, opId: string): Promise<Cre
   const project = job.projectId ? await requireProject(ctx.repo, job.projectId) : await adoptOrCreateProject(ctx, job);
   const projectId = project.id;
   const total = job.drafts.length;
+  const created: Record<string, string> = { ...(job.created ?? {}) };
 
-  const existing = await ctx.repo.steps.listByProject(projectId, { includeArchived: true });
-  const byKey = new Map(existing.map((s) => [s.stepKey, s]));
-  const missing = job.drafts.filter((d) => !byKey.has(stepKeyOf(projectId, d.tempId)));
-  const batch = missing.slice(0, BATCH_SIZE);
+  // The query only finds what a crashed batch created before the job could record it (when Notion already shows it).
+  const listed = await ctx.repo.steps.listByProject(projectId, { includeArchived: true });
+  const byId = new Map(listed.map((s) => [s.id, s]));
+  const firstByKey = new Map<string, StoredStep>();
+  for (const s of listed) if (!firstByKey.has(s.stepKey)) firstByKey.set(s.stepKey, s);
+  let recorded = false;
+  for (const d of job.drafts) {
+    if (created[d.tempId]) continue;
+    const s = firstByKey.get(stepKeyOf(projectId, d.tempId));
+    if (s) {
+      created[d.tempId] = s.id;
+      recorded = true;
+    }
+  }
 
-  const created = await settleAll(
-    batch.map((d) => {
+  const batch = job.drafts.filter((d) => !created[d.tempId]).slice(0, BATCH_SIZE);
+  const { results, error } = await settleSome(
+    batch.map((d) => () => {
       const { tempId, ...rest } = d;
       const input: StepInput = { ...rest, projectId, stepKey: stepKeyOf(projectId, tempId), lastOp: job.opId };
-      return () => ctx.repo.steps.create(input);
+      return ctx.repo.steps.create(input);
     }),
   );
-  for (const s of created) byKey.set(s.stepKey, s);
-
-  const have = job.drafts.filter((d) => byKey.has(stepKeyOf(projectId, d.tempId))).length;
+  results.forEach((s, i) => {
+    if (!s) return;
+    created[batch[i].tempId] = s.id;
+    byId.set(s.id, s);
+    recorded = true;
+  });
+  const have = job.drafts.filter((d) => created[d.tempId]).length;
+  if (recorded) {
+    job.created = created;
+    job.doneCount = have;
+    job.updatedAt = ctx.now;
+    await saveJob(ctx.repo, job);
+  }
+  if (error) throw error;
   if (have < total) {
     return { ...stepResult(false, have, total, `Copied ${have} of ${total} milestones`), projectId, created: have };
   }
 
-  // All steps exist: finalize.
+  // All steps exist: finalize with the recorded ids (steps the query does not show yet are read by id).
+  const unseen = [...new Set(Object.values(created))].filter((id) => !byId.has(id));
+  const read = await settleAll(unseen.map((id) => () => ctx.repo.steps.get(id)));
+  read.forEach((s, i) => {
+    if (s && s.projectId === projectId) byId.set(unseen[i], s);
+  });
+  const lost = job.drafts.filter((d) => !byId.has(created[d.tempId]));
+  if (lost.length) {
+    // A recorded step is gone (deleted in Notion meanwhile): forget it, so the next call creates it again.
+    for (const d of lost) delete created[d.tempId];
+    job.created = created;
+    job.doneCount = total - lost.length;
+    job.updatedAt = ctx.now;
+    await saveJob(ctx.repo, job);
+    return { ...stepResult(false, job.doneCount, total, `Copied ${job.doneCount} of ${total} milestones`), projectId, created: job.doneCount };
+  }
   const idMap: Record<string, string> = {};
   const steps: StoredStep[] = [];
   for (const d of job.drafts) {
-    const s = byKey.get(stepKeyOf(projectId, d.tempId))!;
-    idMap[d.tempId] = s.id;
-    steps.push(s);
+    idMap[d.tempId] = created[d.tempId];
+    steps.push(byId.get(created[d.tempId])!);
   }
   const fresh = await requireProject(ctx.repo, projectId);
   const flow = remapFlow(fresh.flow, idMap);
@@ -298,6 +346,8 @@ export async function continueCreateProject(ctx: Ctx, opId: string): Promise<Cre
     });
   }
   const edgeCount = flow.edges.filter((e) => !e.archivedAt).length;
+  // Second copies go first: the History row is the last write before the tombstone (see continueImport).
+  await discardSteps(ctx, findStepCopies(listed, keyedIds(projectId, created), job.opId));
   await appendHistory(
     ctx,
     {
@@ -311,6 +361,32 @@ export async function continueCreateProject(ctx: Ctx, opId: string): Promise<Cre
   );
   await finishJob(ctx, job, { projectId });
   return { ...stepResult(true, total, total, "Project ready"), projectId, created: total };
+}
+
+/** stepKey → the step id a job recorded for it. */
+export function keyedIds(projectId: string, created: Record<string, string>): Map<string, string> {
+  return new Map(Object.entries(created).map(([tempId, id]) => [stepKeyOf(projectId, tempId), id]));
+}
+
+/**
+ * Second copies of steps a job created: rows with one of the job's step keys that are not the recorded step, still
+ * exactly as the job created them (lastOp = the job's op, never edited).
+ */
+export function findStepCopies(listed: StoredStep[], recorded: Map<string, string>, opId: string): StoredStep[] {
+  return listed.filter((s) => {
+    const keep = recorded.get(s.stepKey);
+    return keep !== undefined && keep !== s.id && s.lastOp === opId && untouched(s);
+  });
+}
+
+/** Moves the given second copies to Notion's trash (recoverable there for 30 days; the app never shows them again). */
+export async function discardSteps(ctx: Ctx, copies: StoredStep[]): Promise<void> {
+  await settleAll(copies.map((s) => () => ctx.repo.steps.discard(s.id)));
+}
+
+/** A step nobody has changed since it was created (no value, N/A, flag or revision). */
+function untouched(s: StoredStep): boolean {
+  return (s.rev ?? 0) === 0 && (s.value ?? null) === null && !s.notApplicable && !s.flag && !s.archived;
 }
 
 /** Runs write thunks in parallel and waits for all of them before throwing the first error (no write left in flight). */
@@ -441,19 +517,104 @@ export async function restoreProject(ctx: Ctx, id: string): Promise<Project> {
 }
 
 /**
+ * How long after a project was written its cells' attachment counts are trusted over the Files query, which can miss
+ * a file added moments ago (or still count one removed moments ago).
+ */
+export const RECENT_WRITE_MS = 120_000;
+
+export interface ReconcileOptions {
+  /**
+   * Settings → Repair mirrors: also rewrite the Notion mirrors (Current, Customer, Project type, Summary) even when the
+   * cells match. Pass every project field (archived included).
+   */
+  rewriteMirrors?: { fields: ProjectField[] };
+}
+
+/**
  * Recomputes Cells and Progress from all steps (+ attachment counts) and PATCHes the project only when they
  * differ. Called after the project page renders and by "Repair mirrors". No History.
+ *
+ * A query can miss steps created moments ago: steps the cells know but the query does not return are read by id, and
+ * a cell is dropped only when its step is archived or gone. Untouched second copies of a step (same stepKey, left by
+ * a retried create) stay out of the cells and go to Notion's trash once the flow uses one copy (see dropStepCopies).
  */
-export async function reconcileProject(ctx: Ctx, projectId: string): Promise<{ changed: boolean }> {
-  const [project, steps, attachments] = await Promise.all([
+export async function reconcileProject(ctx: Ctx, projectId: string, opts: ReconcileOptions = {}): Promise<{ changed: boolean }> {
+  const [project, listed, attachments] = await Promise.all([
     requireProject(ctx.repo, projectId),
     ctx.repo.steps.listByProject(projectId),
     ctx.repo.attachments.listByProject(projectId),
   ]);
   if (project.setup !== "READY") return { changed: false };
-  const cells = buildCells(steps, attachmentCounts(attachments));
+  const steps = await dropStepCopies(ctx, project, await withKnownSteps(ctx.repo, project, listed));
+  const cells = buildCells(steps, countsTrustingRecentCells(ctx, project, attachments));
   const progress = progressOfCells(cells, ctx.day).pct;
-  if (cellsEqual(cells, project.cells ?? {}) && progress === project.progress) return { changed: false };
-  await ctx.repo.projects.update(projectId, { cells, progress, mirrors: { current: currentMirror(cells, project.flow, ctx.day) } });
-  return { changed: true };
+  const same = cellsEqual(cells, project.cells ?? {}) && progress === project.progress;
+  if (same && !opts.rewriteMirrors) return { changed: false };
+  const mirrors = {
+    ...(opts.rewriteMirrors ? projectDetailMirrors(opts.rewriteMirrors.fields, project.details ?? {}) : {}),
+    current: currentMirror(cells, project.flow, ctx.day),
+  };
+  await ctx.repo.projects.update(projectId, same ? { mirrors } : { cells, progress, mirrors });
+  return { changed: !same };
+}
+
+/**
+ * Active attachments per step from the Files query, except right after the project was written (RECENT_WRITE_MS):
+ * then the counts its cells carry win, because the app wrote them from the attachment it had just added or removed
+ * and the query may not show that change yet.
+ */
+export function countsTrustingRecentCells(ctx: Ctx, project: Project, attachments: Attachment[]): Record<string, number> {
+  const counts = attachmentCounts(attachments);
+  if (Date.parse(ctx.now) - Date.parse(project.updatedAt) < RECENT_WRITE_MS) {
+    for (const [id, cell] of Object.entries(project.cells ?? {})) counts[id] = cell.fc ?? 0;
+  }
+  return counts;
+}
+
+/**
+ * The project's active steps: the query result plus, read by id, the steps the project's cells (and `extraIds`) know
+ * but the query does not return (it can miss rows created moments ago). A step read by id is left out only when it is
+ * archived, gone, or belongs to another project.
+ */
+export async function withKnownSteps(repo: Repo, project: Project, listed: StoredStep[], extraIds: string[] = []): Promise<StoredStep[]> {
+  const have = new Set(listed.map((s) => s.id));
+  const unseen = [...new Set([...Object.keys(project.cells ?? {}), ...extraIds])].filter((id) => !have.has(id));
+  if (unseen.length === 0) return listed;
+  const read = await settleAll(unseen.map((id) => () => repo.steps.get(id)));
+  return [...listed, ...read.filter((s): s is StoredStep => !!s && s.projectId === project.id && !s.archived)];
+}
+
+/**
+ * Steps sharing a stepKey are copies of one step (a create retried while the query did not show the first one). The
+ * copy the project uses (in the flow, else in the cells, else the oldest) stays in the cells; untouched copies outside
+ * the flow are left out of them. They go to Notion's trash only once one copy is in the flow: until then a create or
+ * sync job may still be running and decides itself which copy it keeps (it records its own). Copies someone has
+ * edited stay (nothing is lost; they show as separate steps).
+ */
+async function dropStepCopies(ctx: Ctx, project: Project, steps: StoredStep[]): Promise<StoredStep[]> {
+  const byKey = new Map<string, StoredStep[]>();
+  for (const s of steps) {
+    if (!s.stepKey) continue;
+    const group = byKey.get(s.stepKey) ?? [];
+    group.push(s);
+    byKey.set(s.stepKey, group);
+  }
+  const leaveOut = new Set<string>();
+  const discard: string[] = [];
+  const inFlow = (s: StoredStep) => Object.prototype.hasOwnProperty.call(project.flow?.nodes ?? {}, s.id);
+  const inCells = (s: StoredStep) => Object.prototype.hasOwnProperty.call(project.cells ?? {}, s.id);
+  for (const group of byKey.values()) {
+    if (group.length < 2) continue;
+    const oldest = [...group].sort((a, b) => (a.createdAt < b.createdAt ? -1 : a.createdAt > b.createdAt ? 1 : 0))[0];
+    const placed = group.find(inFlow);
+    const keeper = placed ?? group.find(inCells) ?? oldest;
+    for (const s of group) {
+      if (s === keeper || inFlow(s) || !untouched(s)) continue;
+      leaveOut.add(s.id);
+      if (placed) discard.push(s.id);
+    }
+  }
+  if (leaveOut.size === 0) return steps;
+  await settleAll(discard.map((id) => () => ctx.repo.steps.discard(id)));
+  return steps.filter((s) => !leaveOut.has(s.id));
 }

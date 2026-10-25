@@ -23,12 +23,12 @@ import {
 import { callAction, toastError } from "./call";
 import { when } from "./format";
 import { Notice } from "./notice";
+import { currentSetupStep, setupStepState } from "./setup-steps";
 import { useJob } from "./use-job";
 
 export const README_SETUP_URL = "https://github.com/ronnieyap1001/gunnebo_pm#one-time-setup-about-15-minutes";
 
 type OpenJob = SetupStatusDTO["openJobs"][number];
-type StepKey = "connect" | "page" | "databases" | "seed";
 
 const JOB_LABEL: Record<OpenJob["kind"], string> = {
   import: "Loading milestones into the template",
@@ -45,13 +45,7 @@ function schemaProgress(p: JobProgress, previous: JobProgress | null): JobProgre
   return { ...p, fraction: Math.min(0.97, Math.max(prev, 0.85) + 0.03) };
 }
 
-function currentStep(s: SetupStatusDTO): StepKey | "ready" {
-  if (s.mode === "unconfigured") return "connect";
-  if (!s.parentPage) return "page";
-  if (!s.schemaReady) return "databases";
-  if (!s.seeded) return "seed";
-  return "ready";
-}
+const currentStep = currentSetupStep;
 
 export function SetupScreen({
   status: initial,
@@ -211,36 +205,71 @@ export function SetupScreen({
     <main className="mx-auto w-full max-w-3xl space-y-5 px-4 py-6">
       <div className="flex flex-wrap items-center gap-2 text-sm text-muted-foreground">
         <span className="min-w-0 flex-1">Gunnebo PM keeps all its data in your Notion workspace. These steps run once and take a few minutes.</span>
-        <ModeBadge mode={status.mode} />
+        <ModeBadge mode={status.mode} tokenRejected={status.errorKind === "tokenRejected"} />
       </div>
 
       {step === "ready" ? (
         <ReadyCard status={status} />
       ) : null}
 
+      {step === "busy" ? (
+        <Notice tone="warning" title="Notion is busy, try again" action={checkButton}>
+          <p>
+            Notion is busy or did not answer, so the app could not check the setup. Nothing needs to change in Notion or
+            Vercel. Wait a minute, then click <strong>Check again</strong>.
+          </p>
+        </Notice>
+      ) : null}
+
       <ol className="overflow-hidden rounded-xl border bg-card" aria-label="Setup steps">
         <StepRow
           n={1}
           title="Connect to Notion"
-          state={step === "connect" ? "current" : "done"}
+          state={setupStepState("connect", step)}
           doneText={status.mode === "fake" ? "Using local test data on this computer (no Notion token set)." : "The app has a Notion connection."}
         >
-          <p>The app can&apos;t reach Notion yet because the <Code>NOTION_TOKEN</Code> setting is missing in Vercel.</p>
-          <ol className="list-decimal space-y-1 pl-5">
-            <li>
-              In Notion, open <ExtLink href="https://www.notion.so/profile/integrations">Settings → Integrations</ExtLink> and choose{" "}
-              <strong>Gunnebo PM app</strong> (if it isn&apos;t there, click <strong>New integration</strong>, name it Gunnebo PM app and
-              save). Click <strong>Show</strong> next to the secret and copy it. It starts with <Code>ntn_</Code>.
-            </li>
-            <li>
-              In Vercel, open this project, then <strong>Settings → Environment Variables</strong>. Add <Code>NOTION_TOKEN</Code> with that
-              secret and tick Production, Preview and Development.
-            </li>
-            <li>
-              Open <strong>Deployments</strong>, click <strong>⋯</strong> on the newest one and choose <strong>Redeploy</strong>. When it
-              has finished, come back here and click <strong>Check again</strong>.
-            </li>
-          </ol>
+          {status.errorKind === "tokenRejected" ? (
+            <>
+              <p>
+                Notion rejected the secret: copy it again into <Code>NOTION_TOKEN</Code> and redeploy. This happens when the secret was
+                mistyped, or was renewed in Notion.
+              </p>
+              <ol className="list-decimal space-y-1 pl-5">
+                <li>
+                  In Notion, open <ExtLink href="https://www.notion.so/profile/integrations">Settings → Integrations</ExtLink> and choose{" "}
+                  <strong>Gunnebo PM app</strong>. Click <strong>Show</strong> next to the secret and copy it. It starts with{" "}
+                  <Code>ntn_</Code>.
+                </li>
+                <li>
+                  In Vercel, open this project, then <strong>Settings → Environment Variables</strong>. Edit <Code>NOTION_TOKEN</Code>,
+                  replace its value with the secret you copied and save.
+                </li>
+                <li>
+                  Open <strong>Deployments</strong>, click <strong>⋯</strong> on the newest one and choose <strong>Redeploy</strong>. When
+                  it has finished, come back here and click <strong>Check again</strong>.
+                </li>
+              </ol>
+            </>
+          ) : (
+            <>
+              <p>The app can&apos;t reach Notion yet because the <Code>NOTION_TOKEN</Code> setting is missing in Vercel.</p>
+              <ol className="list-decimal space-y-1 pl-5">
+                <li>
+                  In Notion, open <ExtLink href="https://www.notion.so/profile/integrations">Settings → Integrations</ExtLink> and choose{" "}
+                  <strong>Gunnebo PM app</strong> (if it isn&apos;t there, click <strong>New integration</strong>, name it Gunnebo PM app and
+                  save). Click <strong>Show</strong> next to the secret and copy it. It starts with <Code>ntn_</Code>.
+                </li>
+                <li>
+                  In Vercel, open this project, then <strong>Settings → Environment Variables</strong>. Add <Code>NOTION_TOKEN</Code> with that
+                  secret and tick Production, Preview and Development.
+                </li>
+                <li>
+                  Open <strong>Deployments</strong>, click <strong>⋯</strong> on the newest one and choose <strong>Redeploy</strong>. When it
+                  has finished, come back here and click <strong>Check again</strong>.
+                </li>
+              </ol>
+            </>
+          )}
           <Problems problems={status.problems} />
           <div className="flex flex-wrap items-center gap-3 pt-1">
             {checkButton}
@@ -251,7 +280,7 @@ export function SetupScreen({
         <StepRow
           n={2}
           title={`Find the “${parentTitle}” page in Notion`}
-          state={step === "connect" ? "todo" : step === "page" ? "current" : "done"}
+          state={setupStepState("page", step)}
           doneText={
             status.parentPage ? (
               <>
@@ -286,7 +315,7 @@ export function SetupScreen({
         <StepRow
           n={3}
           title="Create the databases"
-          state={step === "connect" || step === "page" ? "todo" : step === "databases" ? "current" : "done"}
+          state={setupStepState("databases", step)}
           doneText={`All ${status.databases.length || 8} databases are in place.`}
         >
           {needsRepair ? (
@@ -329,7 +358,7 @@ export function SetupScreen({
         <StepRow
           n={4}
           title="Load the 64 milestones"
-          state={step === "ready" ? "done" : step === "seed" ? "current" : "todo"}
+          state={setupStepState("seed", step)}
           doneText="The Milestone Library and Template Flow are loaded."
           last
         >
@@ -482,8 +511,8 @@ function Problems({ problems }: { problems: string[] }) {
   );
 }
 
-function ModeBadge({ mode }: { mode: SetupStatusDTO["mode"] }) {
-  if (mode === "notion") {
+function ModeBadge({ mode, tokenRejected }: { mode: SetupStatusDTO["mode"]; tokenRejected?: boolean }) {
+  if (mode === "notion" && !tokenRejected) {
     return (
       <Badge variant="outline">
         <Plug aria-hidden />

@@ -27,15 +27,26 @@ import {
   finishJob,
   isFinished,
   loadJob,
+  loadJobForContinue,
   newJob,
   saveJob,
+  settleSome,
   stepResult,
   type JobBase,
   type JobStepResult,
 } from "./jobs";
 import { getTemplate } from "./library";
 import { attachmentCounts, buildCells, currentMirror, progressOfCells, stepMirrorsOf, stepState, valueSnapshot } from "./mirrors";
-import { requireProject, settleAll, stepKeyOf } from "./projects";
+import {
+  countsTrustingRecentCells,
+  discardSteps,
+  findStepCopies,
+  keyedIds,
+  requireProject,
+  settleAll,
+  stepKeyOf,
+  withKnownSteps,
+} from "./projects";
 
 export interface SyncPreviewItem extends SyncItem {
   /** Declined earlier for exactly this change (Project.syncDismissed); shown unticked and not counted as pending. */
@@ -83,12 +94,14 @@ export function decoratePlan(
 }
 
 async function loadInput(repo: Repo, projectId: string) {
-  const [project, steps, attachments, template] = await Promise.all([
+  const [project, listed, attachments, template] = await Promise.all([
     requireProject(repo, projectId),
     repo.steps.listByProject(projectId, { includeArchived: true }),
     repo.attachments.listByProject(projectId),
     getTemplate(repo),
   ]);
+  // A step created moments ago may not be in the query yet: without it the plan would add its milestone again.
+  const steps = await withKnownSteps(repo, project, listed);
   return { project, steps, counts: attachmentCounts(attachments), template };
 }
 
@@ -106,6 +119,11 @@ export interface SyncJob extends JobBase<"sync"> {
   templateRevision: number;
   /** Steps whose patch is already written (besides lastOp === opId). */
   patchedStepIds?: string[];
+  /**
+   * tempId → id of the step created for a new milestone, saved after every batch (a lagging query must not make the
+   * next batch create it a second time).
+   */
+  createdStepIds?: Record<string, string>;
   /** Rev of each patched step when the plan was made: a step changed since then gets a re-based patch. */
   baseRevs?: Record<string, number>;
   /** Hash of the project flow the plan was made from, and what the plan changes in it. */
@@ -280,12 +298,14 @@ export interface SyncProgress extends JobStepResult {
 }
 
 /**
- * Creates new steps (≤ 8 per call, idempotent by stepKey), applies step patches (≤ 8 per call, skipped when
- * lastOp === opId), then finalizes: remapped flow, cells rebuilt from fresh steps, templateRevision, unticked items
- * merged into syncDismissed, ONE History row `project.synced`, job cleared.
+ * Creates new steps (≤ 8 per call; their ids are recorded in the job, stepKey finds what a crashed batch created
+ * before it could record it), applies step patches (≤ 8 per call, skipped when lastOp === opId), then finalizes:
+ * remapped flow, cells rebuilt from fresh steps, templateRevision, unticked items merged into syncDismissed, second
+ * copies moved to Notion's trash, ONE History row `project.synced`, job cleared. The job is saved after every
+ * batch. Steps a lagging query does not show yet are read by id.
  */
 export async function continueSync(ctx: Ctx, opId: string): Promise<SyncProgress> {
-  const job = await loadJob<SyncJob>(ctx.repo, opId);
+  const job = await loadJobForContinue<SyncJob>(ctx.repo, opId);
   if (!job || job.kind !== "sync") throw new AppError("NOT_FOUND", "This sync was not found. Open the preview again.");
   if (isFinished(job)) {
     return { ...stepResult(true, job.total, job.total, "Sync finished"), projectId: job.projectId ?? "" };
@@ -293,33 +313,70 @@ export async function continueSync(ctx: Ctx, opId: string): Promise<SyncProgress
   const projectId = job.projectId;
   const { result } = job;
   const total = job.total;
+  const created: Record<string, string> = { ...(job.createdStepIds ?? {}) };
 
   const all = await ctx.repo.steps.listByProject(projectId, { includeArchived: true });
-  const byKey = new Map(all.map((s) => [s.stepKey, s]));
   const byId = new Map(all.map((s) => [s.id, s]));
+  const firstByKey = new Map<string, StoredStep>();
+  for (const s of all) if (!firstByKey.has(s.stepKey)) firstByKey.set(s.stepKey, s);
+  let dirty = false;
+  for (const d of result.newSteps) {
+    if (created[d.tempId]) continue;
+    const s = firstByKey.get(stepKeyOf(projectId, d.tempId));
+    if (s) {
+      created[d.tempId] = s.id;
+      dirty = true;
+    }
+  }
+  // Steps this job created or patches that the query does not show yet: read them by id.
+  const unseen = [...new Set([...Object.values(created), ...result.stepPatches.map((p) => p.stepId)])].filter((id) => !byId.has(id));
+  const read = await settleAll(unseen.map((id) => () => ctx.repo.steps.get(id)));
+  read.forEach((s) => {
+    if (s && s.projectId === projectId) byId.set(s.id, s);
+  });
+  for (const [tempId, id] of Object.entries(created)) {
+    if (byId.has(id)) continue;
+    // A recorded step is gone (deleted in Notion meanwhile): forget it, so it is created again.
+    delete created[tempId];
+    dirty = true;
+  }
   let budget = BATCH_SIZE;
 
   // 1. New steps.
-  const toCreate = result.newSteps.filter((d) => !byKey.has(stepKeyOf(projectId, d.tempId)));
+  const toCreate = result.newSteps.filter((d) => !created[d.tempId]);
   const createBatch = toCreate.slice(0, budget);
-  const created = await settleAll(
+  const made = await settleSome(
     createBatch.map((d) => () => {
       const { tempId, ...rest } = d;
       const input: StepInput = { ...rest, projectId, stepKey: stepKeyOf(projectId, tempId), lastOp: job.opId };
       return ctx.repo.steps.create(input);
     }),
   );
-  for (const s of created) {
-    byKey.set(s.stepKey, s);
+  made.results.forEach((s, i) => {
+    if (!s) return;
+    created[createBatch[i].tempId] = s.id;
     byId.set(s.id, s);
-  }
+    dirty = true;
+  });
+  const error = made.error;
   budget -= createBatch.length;
   const applied = new Set(job.patchedStepIds ?? []);
   const isPatched = (stepId: string) => applied.has(stepId) || byId.get(stepId)?.lastOp === job.opId;
   const doneSoFar = () =>
-    result.newSteps.filter((d) => byKey.has(stepKeyOf(projectId, d.tempId))).length +
-    result.stepPatches.filter((p) => isPatched(p.stepId)).length;
-  if (toCreate.length > createBatch.length) {
+    result.newSteps.filter((d) => created[d.tempId]).length + result.stepPatches.filter((p) => isPatched(p.stepId)).length;
+  const createsLeft = toCreate.length > createBatch.length;
+  const saveProgress = async () => {
+    // Remember what was created and patched, so a later batch never creates a step twice and a later user edit of
+    // a patched step (new lastOp) never gets the patch again, also when the finalize below is interrupted and resumed.
+    job.createdStepIds = created;
+    job.patchedStepIds = [...applied];
+    job.doneCount = doneSoFar();
+    job.updatedAt = ctx.now;
+    await saveJob(ctx.repo, job);
+  };
+  if (error || createsLeft) {
+    if (dirty) await saveProgress();
+    if (error) throw error;
     return { ...stepResult(false, doneSoFar(), total, `Adding milestones (${doneSoFar()} of ${total})`), projectId };
   }
 
@@ -328,7 +385,7 @@ export async function continueSync(ctx: Ctx, opId: string): Promise<SyncProgress
   const counts = attachmentCounts(attachments);
   const pending = result.stepPatches.filter((p) => byId.has(p.stepId) && !isPatched(p.stepId));
   const patchBatch = pending.slice(0, budget);
-  const patched = await settleAll(
+  const patched = await settleSome(
     patchBatch.map((p) => () => {
       const s = byId.get(p.stepId)!;
       const base = job.baseRevs?.[s.id];
@@ -345,18 +402,14 @@ export async function continueSync(ctx: Ctx, opId: string): Promise<SyncProgress
       return ctx.repo.steps.update(s.id, patch);
     }),
   );
-  for (const s of patched) {
+  for (const s of patched.results) {
+    if (!s) continue;
     byId.set(s.id, s);
     applied.add(s.id);
+    dirty = true;
   }
-  if (patched.length > 0) {
-    // Remember what was patched, so a later user edit of such a step (new lastOp) never gets the patch again,
-    // also when the finalize below is interrupted and resumed.
-    job.patchedStepIds = [...applied];
-    job.doneCount = doneSoFar();
-    job.updatedAt = ctx.now;
-    await saveJob(ctx.repo, job);
-  }
+  if (dirty) await saveProgress();
+  if (patched.error) throw patched.error;
   if (pending.length > patchBatch.length) {
     return { ...stepResult(false, doneSoFar(), total, `Updating milestones (${doneSoFar()} of ${total})`), projectId };
   }
@@ -364,18 +417,19 @@ export async function continueSync(ctx: Ctx, opId: string): Promise<SyncProgress
   // 3. Finalize.
   const project = await requireProject(ctx.repo, projectId);
   const idMap: Record<string, string> = {};
-  for (const d of result.newSteps) {
-    const s = byKey.get(stepKeyOf(projectId, d.tempId));
-    if (s) idMap[d.tempId] = s.id;
-  }
+  for (const d of result.newSteps) if (created[d.tempId] && byId.has(created[d.tempId])) idMap[d.tempId] = created[d.tempId];
   // The planned flow as is when the project flow is still the one the plan was made from; otherwise only the plan's
   // changes, applied onto the flow as it is now (positions moved and arrows drawn meanwhile are kept).
   const flow =
     !job.flowDelta || !job.baseFlowHash || flowHash(project.flow) === job.baseFlowHash
       ? remapFlow(result.flow, idMap)
       : applyFlowDelta(project.flow, job.flowDelta, idMap);
-  const steps: StoredStep[] = [...byId.values()];
-  const cells = buildCells(steps, counts);
+  // Every step of the project: what the query showed, what this job created or patched, and (read by id) steps the
+  // cells know that the query does not show yet; not the second copies a crashed batch may have left.
+  const copies = findStepCopies(all, keyedIds(projectId, created), job.opId);
+  const copyIds = new Set(copies.map((s) => s.id));
+  const steps: StoredStep[] = (await withKnownSteps(ctx.repo, project, [...byId.values()])).filter((s) => !copyIds.has(s.id));
+  const cells = buildCells(steps, countsTrustingRecentCells(ctx, project, attachments));
   const progress = progressOfCells(cells, ctx.day).pct;
   const dismissed = { ...(project.syncDismissed ?? {}) };
   for (const id of result.appliedItemIds) delete dismissed[dismissKeyOf(id)];
@@ -388,6 +442,8 @@ export async function continueSync(ctx: Ctx, opId: string): Promise<SyncProgress
     syncDismissed: dismissed,
     mirrors: { current: currentMirror(cells, flow, ctx.day) },
   });
+  // Second copies go first: the History row is the last write before the tombstone (see continueImport).
+  await discardSteps(ctx, copies);
 
   const n = result.appliedItemIds.length;
   const declined = Object.keys(job.unselected);

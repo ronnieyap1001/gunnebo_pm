@@ -7,7 +7,9 @@ import { storageMode } from "./client";
 import {
   NotConfiguredError,
   NotSharedError,
+  NotionBusyError,
   NotionError,
+  NotionUnavailableError,
   SetupIncompleteError,
   isNotionCode,
   mapNotionError,
@@ -35,9 +37,10 @@ import {
  * then by the id saved in Settings 'schema.registry', then by name, so renaming a property in Notion
  * never breaks the app.
  *
- * Caching: `createRegistryHandle` memoises the registry per instance (complete: 1 h, incomplete: 10 s) and
- * accepts an external `loader`, so the app can wrap `discoverRegistry` with Next's unstable_cache
- * (this module does not import next/*). After a stale-id error the memo is dropped and the next load
+ * Caching: `createRegistryHandle` memoises the registry per instance (complete: 1 h, or 1 min with a shared loader;
+ * incomplete: 10 s) and accepts an external `loader`: the app wraps `discoverShareableRegistry` with Next's
+ * unstable_cache (src/server/queries/cached.ts; this module does not import next/*), so every server instance shares
+ * one discovery. Only a ready registry is shared. After a stale-id error the memo is dropped and the next load
  * bypasses the external loader once.
  */
 
@@ -90,24 +93,47 @@ export interface RegistryOptions {
   parentTitle?: string;
   /** Create the parent page when it is missing (default: only in fake mode). */
   createParentIfMissing?: boolean;
+  /** Defaults to env VERCEL_ENV ('production', 'preview', 'development' or unset). */
+  vercelEnv?: string;
 }
 
 export const SETTINGS_REGISTRY_KEY = "schema.registry";
 export const SETTINGS_SCHEMA_VERSION_KEY = "schema.version";
 export const SETTINGS_SEED_KEY = "seed.appliedAt";
 
+export const PRODUCTION_PARENT_TITLE = "Gunnebo PM";
+export const PREVIEW_PARENT_TITLE = "Gunnebo PM (Preview)";
+
 export function parentTitleFor(env: EnvLike = process.env): string {
-  return env.VERCEL_ENV === "preview" ? "Gunnebo PM (Preview)" : "Gunnebo PM";
+  return env.VERCEL_ENV === "preview" ? PREVIEW_PARENT_TITLE : PRODUCTION_PARENT_TITLE;
 }
 
-function resolveOptions(opts: RegistryOptions = {}): Required<Omit<RegistryOptions, "parentPageId">> & { parentPageId?: string } {
+function resolveOptions(
+  opts: RegistryOptions = {},
+): Required<Omit<RegistryOptions, "parentPageId" | "vercelEnv">> & { parentPageId?: string; vercelEnv?: string } {
   const mode = opts.mode ?? storageMode();
   return {
     mode,
     parentPageId: opts.parentPageId ?? (process.env.NOTION_PARENT_PAGE_ID || undefined),
     parentTitle: opts.parentTitle ?? parentTitleFor(),
     createParentIfMissing: opts.createParentIfMissing ?? mode === "fake",
+    vercelEnv: "vercelEnv" in opts ? opts.vercelEnv : process.env.VERCEL_ENV,
   };
+}
+
+/**
+ * Preview deployments must never touch real data, and production must never run on the test page: the page named in
+ * NOTION_PARENT_PAGE_ID has to have the title of its environment. Returns the problem in plain English, or null.
+ */
+export function parentPageProblem(title: string, vercelEnv: string | undefined): string | null {
+  const t = title.trim();
+  if (vercelEnv === "preview" && t !== PREVIEW_PARENT_TITLE) {
+    return `NOTION_PARENT_PAGE_ID points to the page "${t}", but preview versions only use the page "${PREVIEW_PARENT_TITLE}", so they never change real data. In Vercel, set NOTION_PARENT_PAGE_ID for Production only (untick Preview and Development), then redeploy.`;
+  }
+  if (vercelEnv === "production" && t === PREVIEW_PARENT_TITLE) {
+    return `NOTION_PARENT_PAGE_ID points to "${PREVIEW_PARENT_TITLE}", the page with test data for preview versions. In Vercel, set NOTION_PARENT_PAGE_ID for Production only to the link of your "${PRODUCTION_PARENT_TITLE}" page, then redeploy.`;
+  }
+  return null;
 }
 
 // ---------------------------------------------------------------------------
@@ -164,6 +190,8 @@ async function findParent(
       const p = await notion.pages.retrieve({ page_id: id });
       if (!isFullPage(p)) return { parent: null, problems: ["Notion returned an incomplete page for NOTION_PARENT_PAGE_ID."] };
       if (p.in_trash) return { parent: null, problems: ["The page in NOTION_PARENT_PAGE_ID is in Notion's trash. Restore it first."] };
+      const wrongPage = parentPageProblem(pageTitle(p), o.vercelEnv);
+      if (wrongPage) return { parent: null, problems: [wrongPage] };
       return { parent: { id: p.id, title: pageTitle(p), url: p.url }, problems: [] };
     } catch (e) {
       if (isNotionCode(e, "object_not_found") || isNotionCode(e, "validation_error")) {
@@ -197,7 +225,11 @@ async function findParent(
   if (matches.length > 1) {
     return {
       parent: null,
-      problems: [`Several Notion pages are called "${title}". Put the link of the right one into NOTION_PARENT_PAGE_ID and redeploy.`],
+      problems: [
+        o.vercelEnv === "preview"
+          ? `Several Notion pages are called "${title}". Rename or move to the trash all but one of them, then click Check again.`
+          : `Several Notion pages are called "${title}". In Vercel, add NOTION_PARENT_PAGE_ID with the link of the right one for Production only (untick Preview and Development), then redeploy.`,
+      ],
     };
   }
   if (o.createParentIfMissing) {
@@ -748,31 +780,71 @@ export interface RegistryHandle {
 }
 
 export interface RegistryHandleOptions extends RegistryOptions {
-  /** e.g. `unstable_cache(() => discoverRegistry(getNotion()), ['schema', String(SCHEMA_VERSION)], { tags: ['schema'], revalidate: 3600 })`. */
+  /**
+   * A cache shared by every server instance, e.g. `unstable_cache(() => discoverShareableRegistry(getNotion()),
+   * ['schema', String(SCHEMA_VERSION)], { tags: ['schema'], revalidate: 3600 })`. It may throw UnsharedRegistry (a
+   * registry that must not be shared is then used by this instance only); any other error that is not a Notion error
+   * (the cache itself is unavailable) falls back to a direct discovery.
+   */
   loader?: () => Promise<Registry>;
   /** Called after reset() (e.g. to revalidateTag('schema') where allowed). */
   onReset?: () => void;
 }
 
 const COMPLETE_TTL_MS = 3_600_000;
+/** With a shared loader the instance memo is short: a reset on another instance reaches this one within a minute. */
+const SHARED_TTL_MS = 60_000;
 const INCOMPLETE_TTL_MS = 10_000;
 const handles = new Set<RegistryHandle>();
+
+/**
+ * Thrown by a shared-cache loader for a registry that must not be cached for every instance (setup not finished, or
+ * no parent page): the handle uses `registry` for this instance only, with the short memo of an incomplete registry.
+ */
+export class UnsharedRegistry extends Error {
+  constructor(readonly registry: Registry) {
+    super("The Notion schema is not ready, so it is not shared between server instances.");
+    this.name = "UnsharedRegistry";
+  }
+}
+
+function unsharedRegistryOf(e: unknown): Registry | null {
+  if (e instanceof UnsharedRegistry) return e.registry;
+  // The error may cross a cache boundary as a plain copy.
+  const x = e as { name?: unknown; registry?: unknown } | null;
+  return x && x.name === "UnsharedRegistry" && x.registry && typeof x.registry === "object" ? (x.registry as Registry) : null;
+}
+
+/** Discovery for a cache shared by all instances: returns only a ready registry; any other is thrown as UnsharedRegistry. */
+export async function discoverShareableRegistry(notion: NotionLike, options?: RegistryOptions): Promise<Registry> {
+  const reg = await discoverRegistry(notion, options);
+  if (!isSchemaReady(reg)) throw new UnsharedRegistry(reg);
+  return reg;
+}
 
 export function createRegistryHandle(notion: NotionLike, opts: RegistryHandleOptions = {}): RegistryHandle {
   let memo: { reg: Registry; at: number } | null = null;
   let inflight: Promise<Registry> | null = null;
   let bypassLoader = false;
 
-  const fresh = () => {
+  const fresh = async (): Promise<Registry> => {
     const viaLoader = opts.loader && !bypassLoader;
     bypassLoader = false;
-    return viaLoader ? opts.loader!() : discoverRegistry(notion, opts);
+    if (!viaLoader) return discoverRegistry(notion, opts);
+    try {
+      return await opts.loader!();
+    } catch (e) {
+      const own = unsharedRegistryOf(e);
+      if (own) return own;
+      if (e instanceof NotionError) throw e;
+      return discoverRegistry(notion, opts);
+    }
   };
 
   const handle: RegistryHandle = {
     async load() {
       if (memo) {
-        const ttl = isComplete(memo.reg) ? COMPLETE_TTL_MS : INCOMPLETE_TTL_MS;
+        const ttl = !isComplete(memo.reg) ? INCOMPLETE_TTL_MS : opts.loader ? SHARED_TTL_MS : COMPLETE_TTL_MS;
         if (Date.now() - memo.at < ttl) return memo.reg;
       }
       if (!inflight) {
@@ -888,8 +960,9 @@ export function simplifyValue(v: PropValue): unknown {
 export function createStorageAdmin(notion: NotionLike | (() => NotionLike), handle: RegistryHandle | (() => RegistryHandle), options?: RegistryOptions): StorageAdmin {
   const n = () => (typeof notion === "function" ? notion() : notion);
   const h = () => (typeof handle === "function" ? handle() : handle);
-  // 'seed.appliedAt' never goes away except through trashAll / resetCaches: once seen, status() stops querying it.
-  let seededSeen = false;
+  // 'seed.appliedAt' never goes away except through trashAll / resetCaches: once seen in a Settings database,
+  // status() stops querying it (until the registry names another Settings database, e.g. after Start over elsewhere).
+  let seededIn: string | null = null;
 
   return {
     async status(): Promise<SetupStatus> {
@@ -899,11 +972,24 @@ export function createStorageAdmin(notion: NotionLike | (() => NotionLike), hand
         return { mode, problems: [new NotConfiguredError().message], databases: empty, schemaReady: false, seeded: false };
       }
       try {
-        const reg = await h().load();
-        let seeded = seededSeen;
+        let reg = await h().load();
+        let settingsDs = reg.dbs.settings?.dataSourceId ?? null;
+        let seeded = settingsDs !== null && seededIn === settingsDs;
         if (!seeded && reg.dbs.settings && reg.dbs.settings.missing.length === 0) {
-          seeded = (await findSettingRow(n(), reg.dbs.settings, SETTINGS_SEED_KEY)) !== null;
-          seededSeen = seeded;
+          let row: PageObjectResponse | null;
+          try {
+            row = await findSettingRow(n(), reg.dbs.settings, SETTINGS_SEED_KEY);
+          } catch (e) {
+            // The registry (e.g. the copy all instances share) names a Settings database that is gone: Start over ran
+            // elsewhere, or the databases were moved in Notion. Drop it and discover again, once.
+            if (!isNotionCode(e, "object_not_found")) throw e;
+            h().reset();
+            reg = await h().load();
+            settingsDs = reg.dbs.settings?.dataSourceId ?? null;
+            row = reg.dbs.settings && reg.dbs.settings.missing.length === 0 ? await findSettingRow(n(), reg.dbs.settings, SETTINGS_SEED_KEY) : null;
+          }
+          seeded = row !== null;
+          seededIn = seeded ? settingsDs : null;
         }
         const warnings = [...reg.warnings];
         const tidy = cosmeticWork(reg);
@@ -920,7 +1006,15 @@ export function createStorageAdmin(notion: NotionLike | (() => NotionLike), hand
       } catch (e) {
         const mapped = mapNotionError(e);
         if (!(mapped instanceof NotionError)) throw mapped;
-        return { mode, problems: [mapped.message], databases: empty, schemaReady: false, seeded: false };
+        // Say why Notion could not be read, so Setup shows the right step: a rejected token is step 1 (copy the secret
+        // again); a busy or unavailable Notion is "try again", not "create the page".
+        const errorKind =
+          mapped instanceof NotConfiguredError
+            ? ("tokenRejected" as const)
+            : mapped instanceof NotionBusyError || mapped instanceof NotionUnavailableError
+              ? ("busy" as const)
+              : undefined;
+        return { mode, problems: [mapped.message], databases: empty, schemaReady: false, seeded: false, ...(errorKind ? { errorKind } : {}) };
       }
     },
 
@@ -931,7 +1025,7 @@ export function createStorageAdmin(notion: NotionLike | (() => NotionLike), hand
     },
 
     async resetCaches() {
-      seededSeen = false;
+      seededIn = null;
       resetRegistryCaches();
       setupMemo.delete(n());
     },
@@ -948,7 +1042,7 @@ export function createStorageAdmin(notion: NotionLike | (() => NotionLike), hand
       } catch (e) {
         throw mapNotionError(e);
       } finally {
-        seededSeen = false;
+        seededIn = null;
         resetRegistryCaches();
         setupMemo.delete(n());
       }

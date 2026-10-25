@@ -8,6 +8,7 @@ import type { TemplateFile } from "@/domain/templateFile";
 import type { Iso, Ymd } from "@/domain/types";
 import type { StoredStep } from "@/server/repo/types";
 import { makeCtx, type Ctx, type MakeCtxOptions } from "@/server/services/context";
+import { JOB_LOOKUP } from "@/server/services/jobs";
 import { continueCreateProject, startCreateProject, type CreateProjectInput } from "@/server/services/projects";
 import { continueImport, startImport, startSeed, type ImportReason } from "@/server/services/templateIo";
 import { continueSync, startSync } from "@/server/services/sync";
@@ -24,6 +25,8 @@ export interface World {
 }
 
 export function world(): World {
+  // The in-memory repo has no query lag: waits for a lagging Notion (job lookup, duplicate check) need no real time.
+  JOB_LOOKUP.sleep = async () => undefined;
   let t = Date.parse(NOW);
   const repo = createMemoryRepo({ clock: () => new Date((t += 1000)).toISOString() });
   return {

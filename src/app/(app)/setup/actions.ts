@@ -9,7 +9,10 @@ import { getStorageAdmin } from "@/server/repo";
 import { readSetupStatus } from "./status";
 import { continueCreateProject, continueImport, continueSync, startSeed, type JobStepResult } from "@/server/services";
 
-const ALL_TAGS = [TAGS.library, TAGS.projectFields, TAGS.settings];
+/** Data the seed and imports change (refreshed after every batch). */
+const DATA_TAGS = [TAGS.library, TAGS.projectFields, TAGS.settings];
+/** Everything, the shared Notion schema registry included ("Check again", end of the Notion setup). */
+const ALL_TAGS = [...DATA_TAGS, TAGS.schema];
 const id = z.string().min(8).max(64);
 
 function refreshAllTags() {
@@ -46,13 +49,13 @@ export async function startSeedAction(opId: string): Promise<ActionResult<{ tota
   return runAction(opId, async (ctx) => {
     const r = await startSeed(ctx);
     return { total: r.total };
-  }, { tags: ALL_TAGS });
+  }, { tags: DATA_TAGS });
 }
 
 /** Next batch of an import job (seed, reset or file import). Same opId as the job. */
 export async function continueImportAction(opId: string): Promise<ActionResult<JobStepResult>> {
   if (!id.safeParse(opId).success) return fail("This task is missing its id. Reload the page and try again.", "VALIDATION");
-  return runAction(opId, (ctx) => continueImport(ctx, opId), { tags: ALL_TAGS });
+  return runAction(opId, (ctx) => continueImport(ctx, opId), { tags: DATA_TAGS });
 }
 
 /** Resumes a project creation that was interrupted (e.g. the tab was closed). */
@@ -70,5 +73,5 @@ export async function continueSyncAction(opId: string): Promise<ActionResult<Job
   return runAction(opId, async (ctx) => {
     const r = await continueSync(ctx, opId);
     return { done: r.done, message: r.message, fraction: r.fraction, total: r.total, doneCount: r.doneCount, projectId: r.projectId };
-  }, { tags: ALL_TAGS });
+  }, { tags: DATA_TAGS });
 }

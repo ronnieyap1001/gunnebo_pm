@@ -49,6 +49,7 @@ export async function readSetupStatus(): Promise<SetupStatusDTO> {
         databases: [],
         schemaReady: false,
         seeded: false,
+        errorKind: "busy",
         openJobs: [],
       };
     }
