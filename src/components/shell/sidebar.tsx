@@ -23,10 +23,10 @@ import { AppMark } from "./app-mark";
 import { logout } from "@/app/login/actions";
 
 const MAIN_NAV = [
-  { href: "/portfolio", label: "Portfolio", icon: LayoutGrid, key: "1" },
-  { href: "/projects", label: "Projects", icon: FolderKanban, key: "2" },
-  { href: "/library", label: "Milestone Library", icon: Library, key: "3" },
-  { href: "/template", label: "Template Flow", icon: Workflow, key: "4" },
+  { href: "/portfolio", label: "Portfolio", icon: LayoutGrid },
+  { href: "/projects", label: "Projects", icon: FolderKanban },
+  { href: "/library", label: "Milestone Library", icon: Library },
+  { href: "/template", label: "Template Flow", icon: Workflow },
 ];
 
 const FOOTER_NAV = [
@@ -73,7 +73,7 @@ function NavLink({
   );
 }
 
-export function Sidebar({ storageLabel }: { storageLabel?: string }) {
+export function Sidebar() {
   const pathname = usePathname();
   const { resolvedTheme, setTheme } = useTheme();
   const [collapsed, setCollapsed] = useState(false);
@@ -159,7 +159,7 @@ export function Sidebar({ storageLabel }: { storageLabel?: string }) {
           aria-label={collapsed ? "Expand sidebar" : "Collapse sidebar"}
         >
           {collapsed ? <PanelLeftOpen className="size-4" /> : <PanelLeftClose className="size-4" />}
-          {!collapsed && <span>{storageLabel ?? "Collapse"}</span>}
+          {!collapsed && <span>Collapse</span>}
         </button>
       </div>
     </aside>
