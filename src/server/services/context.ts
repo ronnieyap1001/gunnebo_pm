@@ -260,6 +260,45 @@ export function alreadyLogged(ctx: Ctx, opId: string = ctx.opId): Promise<boolea
   return ctx.repo.history.hasOp(opId);
 }
 
+/** How long a created row may be an interrupted attempt of the same action (see findUnloggedCreate). */
+export const ADOPT_WINDOW_MS = 15 * 60_000;
+
+/**
+ * Creates without an idempotency key (notes, links, files) write the row first and the History row after it. When an
+ * attempt crashed in between, its row exists but no History row refers to it. Among `candidates` (rows with the same
+ * content), returns the newest one created in the last 15 minutes that no recent History row of `type` refers to
+ * (through `data[refKey]`), so the retry adopts it instead of creating a duplicate. A row that was logged is never
+ * adopted, so adding the same note twice on purpose still creates two notes.
+ */
+export async function findUnloggedCreate<T extends { id: string; createdAt?: Iso }>(
+  ctx: Ctx,
+  candidates: T[],
+  where: { projectId?: string; type: string; refOf: (e: StoredHistoryEvent) => unknown },
+): Promise<T | undefined> {
+  const now = Date.parse(ctx.now);
+  // Rows without a creation time (project fields) can't be windowed; same-content duplicates of those are never wanted.
+  const recent = candidates.filter((c) => !c.createdAt || Math.abs(now - Date.parse(c.createdAt)) <= ADOPT_WINDOW_MS);
+  if (recent.length === 0) return undefined;
+  const query = { type: where.type, limit: 100 };
+  const page = where.projectId ? await ctx.repo.history.listByProject(where.projectId, query) : await ctx.repo.history.listAll(query);
+  const logged = new Set(page.items.map(where.refOf));
+  const at = (c: T) => c.createdAt ?? "";
+  return recent
+    .filter((c) => !logged.has(c.id))
+    .sort((a, b) => (at(a) < at(b) ? -1 : at(a) > at(b) ? 1 : 0))
+    .pop();
+}
+
+/** `data[key]` of a History row (where creates record the id of what they created). */
+export function dataRef(key: string): (e: StoredHistoryEvent) => unknown {
+  return (e) => (e.data as Record<string, unknown> | undefined)?.[key];
+}
+
+/** A deterministic id for the one arrow an action adds, so a retry of the action recognises it. */
+export function edgeIdForOp(opId: string): string {
+  return `e:${opId}`;
+}
+
 /** JSON-safe copy without undefined members (History data and Settings values go through JSON). */
 export function dropUndefined<T>(value: T): T {
   return JSON.parse(JSON.stringify(value ?? null)) as T;

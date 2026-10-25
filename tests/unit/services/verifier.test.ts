@@ -299,6 +299,150 @@ describe("sync: work done between startSync and the last continueSync", () => {
   });
 });
 
+describe("edits keep the old value in History when a write is interrupted and retried", () => {
+  it("editNote: the original text reaches History whichever write failed", async () => {
+    const { addNote, editNote } = await import("@/server/services/notes");
+    const projectId = await createProject(w);
+    const note = await addNote(w.ctx(), { projectId, body: "Kick-off on Monday" });
+    for (const op of ["history.append", "notes.update"]) {
+      const before = (await w.repo.notes.listByProject(projectId))[0].body;
+      const body = `${before}!`;
+      const opId = randomUUID();
+      crashOn(op);
+      await expect(editNote(w.ctx({ opId }), { projectId, noteId: note.id, body })).rejects.toThrow("crash");
+      await editNote(w.ctx({ opId }), { projectId, noteId: note.id, body });
+      const rows = (await historyOfType(w, EV.noteEdited)).filter((r) => r.opId === opId);
+      expect(rows).toHaveLength(1);
+      expect(rows[0].data).toMatchObject({ oldBody: before, newBody: body });
+      expect((await w.repo.notes.listByProject(projectId))[0].body).toBe(body);
+    }
+  });
+
+  it("updateProject: an old project code always reaches History (Phase 2 maps old codes)", async () => {
+    const { updateProject } = await import("@/server/services/projects");
+    const projectId = await createProject(w, { code: "C0822" });
+    let code = "C0822";
+    for (const op of ["history.append", "projects.update"]) {
+      const next = `${code}-X`;
+      const opId = randomUUID();
+      crashOn(op);
+      await expect(updateProject(w.ctx({ opId }), projectId, { code: next })).rejects.toThrow("crash");
+      await updateProject(w.ctx({ opId }), projectId, { code: next });
+      const rows = (await historyOfType(w, EV.projectCodeChanged)).filter((r) => r.opId === opId);
+      expect(rows).toHaveLength(1);
+      expect(rows[0].data).toMatchObject({ oldCode: code, newCode: next });
+      expect((await w.repo.projects.get(projectId))!.code).toBe(next);
+      code = next;
+    }
+  });
+
+  it("updateMilestone: the old definition reaches History and the revision goes up", async () => {
+    for (const op of ["history.append", "milestones.update"]) {
+      const bom = await milestoneByKey(w, "bom");
+      const r0 = (await getTemplate(w.repo)).revision;
+      const name = `${bom.name} (rev)`;
+      const opId = randomUUID();
+      crashOn(op);
+      await expect(updateMilestone(w.ctx({ opId }), bom.id, { name })).rejects.toThrow("crash");
+      await updateMilestone(w.ctx({ opId }), bom.id, { name });
+      const rows = (await historyOfType(w, EV.milestoneUpdated)).filter((r) => r.opId === opId);
+      expect(rows).toHaveLength(1);
+      expect(rows[0]).toMatchObject({ oldDisplay: bom.name, newDisplay: name });
+      expect((await milestoneByKey(w, "bom")).name).toBe(name);
+      expect((await getTemplate(w.repo)).revision).toBeGreaterThan(r0);
+    }
+  });
+});
+
+describe("positions from the browser are validated", () => {
+  const finite = (nodes: Record<string, { x: number; y: number }>) =>
+    Object.values(nodes).every((p) => Number.isFinite(p.x) && Number.isFinite(p.y));
+
+  it("createMilestone / addProjectStep ignore a malformed position (with or without 'insert after')", async () => {
+    const { layoutProject, layoutTemplate } = await import("@/server/services/library").then(async (lib) => ({
+      layoutTemplate: lib.layoutTemplate,
+      layoutProject: (await import("@/server/services/steps")).layoutProject,
+    }));
+    const bad = { x: "left", y: Number.NaN } as never;
+    const bom = await milestoneByKey(w, "bom");
+    await createMilestone(w.ctx(), { name: "Loose", fieldType: "TEXT", position: bad });
+    await createMilestone(w.ctx(), { name: "After BOM", fieldType: "TEXT", afterMilestoneId: bom.id, position: bad });
+    expect(finite((await getTemplate(w.repo)).flow.nodes)).toBe(true);
+    const projectId = await createProject(w);
+    const bomStep = await stepByKey(w, projectId, "bom");
+    await addProjectStep(w.ctx(), { projectId, name: "Visit", fieldType: "DATE", afterStepId: bomStep.id, position: bad });
+    expect(finite((await w.repo.projects.get(projectId))!.flow.nodes)).toBe(true);
+    // A bad viewport width falls back to the default.
+    expect(finite((await layoutTemplate(w.ctx(), { wrap: true, viewportWidth: Number.NaN })).nodes)).toBe(true);
+    expect(finite((await layoutProject(w.ctx(), projectId, { wrap: true, viewportWidth: -5 })).nodes)).toBe(true);
+  });
+});
+
+describe("small consistency rules", () => {
+  it("an N/A 'Project closed' never prompts 'Set status to Closed?' (same rule as the project page)", async () => {
+    const { setStepNotApplicable } = await import("@/server/services/steps");
+    const { getProjectPageData } = await import("@/server/queries/projects");
+    const projectId = await createProject(w);
+    const closed = await stepByKey(w, projectId, "project-closed");
+    const na = await setStepNotApplicable(w.ctx(), { stepId: closed.id, notApplicable: true, expectedRev: 0 });
+    const r = await setStepValue(w.ctx(), { stepId: closed.id, value: TODAY, expectedRev: na.step.rev });
+    expect(r.suggestClose).toBe(false);
+    expect((await getProjectPageData(w.repo, day, projectId))!.suggestClose).toBe(false);
+  });
+
+  it("a file that turns a FILE step Done also refreshes the step's readable State mirror", async () => {
+    const { addFile } = await import("@/server/services/attachments");
+    const projectId = await createProject(w);
+    const { step } = await addProjectStep(w.ctx(), { projectId, name: "FAT photos", fieldType: "FILE" });
+    await addFile(w.ctx(), { projectId, stepId: step.id, name: "a.jpg", contentType: "image/jpeg", size: 1, data: new Blob([new Uint8Array([1])]) });
+    expect(w.repo.store.mirrors.get(step.id)).toMatchObject({ state: "DONE", display: "1 file" });
+  });
+});
+
+describe("read models and service results are plain JSON (serialisable to Client Components)", () => {
+  /** A JSON round trip gives back an equal value only when there is no Map, Set, Date, function or undefined-in-array. */
+  const plain = (x: unknown) => expect(JSON.parse(JSON.stringify(x))).toStrictEqual(stripUndefined(x));
+  function stripUndefined(x: unknown): unknown {
+    if (Array.isArray(x)) return x.map(stripUndefined);
+    if (x && typeof x === "object" && Object.getPrototypeOf(x) === Object.prototype) {
+      return Object.fromEntries(Object.entries(x).filter(([, v]) => v !== undefined).map(([k, v]) => [k, stripUndefined(v)]));
+    }
+    return x;
+  }
+
+  it("every query DTO and write result survives a JSON round trip unchanged", async () => {
+    const { getPortfolioData } = await import("@/server/queries/portfolio");
+    const { getCellDetails, getProjectPageData, getProjectsList } = await import("@/server/queries/projects");
+    const { getLibraryView, getTemplateView } = await import("@/server/queries/library");
+    const { getArchiveData } = await import("@/server/queries/archive");
+    const { getAllHistory, getProjectHistory, getStepHistory, getTemplateSnapshots } = await import("@/server/queries/history");
+    const { getSettingsData } = await import("@/server/queries/setup");
+    const projectId = await createProject(w);
+    const bom = await stepByKey(w, projectId, "bom");
+    const v = await setStepValue(w.ctx(), { stepId: bom.id, value: "requested", expectedRev: 0 });
+    await createMilestone(w.ctx(), { name: "Extra", fieldType: "TEXT" });
+    plain(v);
+    plain(await previewSync(w.ctx(), projectId));
+    plain(await getPortfolioData(w.repo, day, { includeDateDriven: true, includeWaiting: true }));
+    plain(await getProjectPageData(w.repo, day, projectId));
+    plain(await getProjectsList(w.repo, day));
+    plain(await getCellDetails(w.repo, day, bom.id));
+    plain(await getLibraryView(w.repo));
+    plain(await getTemplateView(w.repo));
+    plain(await getArchiveData(w.repo, { projectId }));
+    plain(await getStepHistory(w.repo, bom.id));
+    plain(await getProjectHistory(w.repo, projectId));
+    plain(await getAllHistory(w.repo));
+    plain(await getTemplateSnapshots(w.repo));
+    plain(await getSettingsData(w.repo, new Date("2026-10-25T02:00:00.000Z")));
+  });
+
+  it("every History type the services write is a known option of the Notion Type select", async () => {
+    const { KNOWN_EVENT_TYPES } = await import("@/server/notion/schema");
+    for (const t of Object.values(EV)) expect(KNOWN_EVENT_TYPES).toContain(t);
+  });
+});
+
 describe("sync History relates to the steps it changed", () => {
   it("the project.synced row shows in each changed step's history with old/new snapshots", async () => {
     const projectId = await createProject(w);

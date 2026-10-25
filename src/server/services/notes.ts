@@ -4,7 +4,7 @@ import "server-only";
  */
 import { truncate } from "@/domain/format";
 import type { Note, Project } from "@/domain/types";
-import { alreadyLogged, appendHistory, AppError, EV, notFound, summaryFor, type Ctx } from "./context";
+import { alreadyLogged, appendHistory, AppError, dataRef, EV, findUnloggedCreate, notFound, summaryFor, type Ctx } from "./context";
 import { requireProject } from "./projects";
 
 export const MAX_NOTE_LENGTH = 20_000;
@@ -41,23 +41,33 @@ function where(name: string | undefined): string {
   return name ? `Note on ${name}` : "Note";
 }
 
-/** History `note.added`: `C0822 · Note on BOM: "Waiting for PE…"`. */
+/**
+ * History `note.added`: `C0822 · Note on BOM: "Waiting for PE…"`. A retry after a crash between the note and its
+ * History row adopts the note the first attempt created (no duplicate, one row).
+ */
 export async function addNote(ctx: Ctx, input: { projectId: string; stepId?: string; body: string }): Promise<Note> {
   const body = requireBody(input.body);
   const project = await requireProject(ctx.repo, input.projectId);
   const step = await stepName(ctx, project, input.stepId);
+  const notes = await ctx.repo.notes.listByProject(project.id);
+  const same = notes.filter((n) => n.body === body && (n.stepId ?? undefined) === (input.stepId ?? undefined));
   if (await alreadyLogged(ctx)) {
-    const notes = await ctx.repo.notes.listByProject(project.id);
-    const same = notes.filter((n) => n.body === body && (n.stepId ?? undefined) === (input.stepId ?? undefined)).pop();
-    if (same) return same;
+    const done = same.pop();
+    if (done) return done;
   }
-  const note = await ctx.repo.notes.create({
-    projectId: project.id,
-    ...(input.stepId ? { stepId: input.stepId } : {}),
-    body,
-    author: ctx.actor,
-    archived: false,
-  });
+  const note =
+    (await findUnloggedCreate(
+      ctx,
+      same.filter((n) => n.author === ctx.actor),
+      { projectId: project.id, type: EV.noteAdded, refOf: dataRef("noteId") },
+    )) ??
+    (await ctx.repo.notes.create({
+      projectId: project.id,
+      ...(input.stepId ? { stepId: input.stepId } : {}),
+      body,
+      author: ctx.actor,
+      archived: false,
+    }));
   await appendHistory(ctx, {
     type: EV.noteAdded,
     summary: summaryFor(project.code, `${where(step.name)}: "${snippet(body)}"`),
@@ -70,16 +80,17 @@ export async function addNote(ctx: Ctx, input: { projectId: string; stepId?: str
   return note;
 }
 
-/** History `note.edited` with the old and new text. */
+/**
+ * History `note.edited` with the old and new text. The row is written before the note: the old text exists nowhere
+ * else, so an interrupted edit must not lose it (a retry with the same opId then finishes the note update).
+ */
 export async function editNote(ctx: Ctx, input: { projectId: string; noteId: string; body: string }): Promise<Note> {
   const body = requireBody(input.body);
   const project = await requireProject(ctx.repo, input.projectId);
   const note = await requireNote(ctx, project.id, input.noteId);
   if (note.archived) throw new AppError("VALIDATION", "This note is deleted. Restore it first.");
   if (note.body === body) return note;
-  if (await alreadyLogged(ctx)) return note;
   const step = await stepName(ctx, project, note.stepId);
-  const updated = await ctx.repo.notes.update(note.id, { body, editedAt: ctx.now });
   await appendHistory(ctx, {
     type: EV.noteEdited,
     summary: summaryFor(project.code, `${where(step.name)} edited: "${snippet(body)}"`),
@@ -90,16 +101,18 @@ export async function editNote(ctx: Ctx, input: { projectId: string; noteId: str
     newDisplay: snippet(body),
     data: { noteId: note.id, stepName: step.name, milestoneKey: step.milestoneKey, oldBody: note.body, newBody: body },
   });
-  return updated;
+  return ctx.repo.notes.update(note.id, { body, editedAt: ctx.now });
 }
 
-/** Deleting a note archives it; the text stays in History. */
+/**
+ * Deleting a note archives it; the text stays in History. Archive / restore write the row first, then the note, so a
+ * retry with the same opId after a crash between the two finishes the change with exactly one row.
+ */
 export async function archiveNote(ctx: Ctx, input: { projectId: string; noteId: string }): Promise<Note> {
   const project = await requireProject(ctx.repo, input.projectId);
   const note = await requireNote(ctx, project.id, input.noteId);
   if (note.archived) return note;
   const step = await stepName(ctx, project, note.stepId).catch(() => ({}) as { name?: string; milestoneKey?: string });
-  const updated = await ctx.repo.notes.update(note.id, { archived: true });
   await appendHistory(ctx, {
     type: EV.noteArchived,
     summary: summaryFor(project.code, `${where(step.name)} deleted: "${snippet(note.body)}"`),
@@ -109,7 +122,7 @@ export async function archiveNote(ctx: Ctx, input: { projectId: string; noteId: 
     oldDisplay: snippet(note.body),
     data: { noteId: note.id, stepName: step.name, milestoneKey: step.milestoneKey, body: note.body },
   });
-  return updated;
+  return ctx.repo.notes.update(note.id, { archived: true });
 }
 
 export async function restoreNote(ctx: Ctx, input: { projectId: string; noteId: string }): Promise<Note> {
@@ -117,7 +130,6 @@ export async function restoreNote(ctx: Ctx, input: { projectId: string; noteId: 
   const note = await requireNote(ctx, project.id, input.noteId);
   if (!note.archived) return note;
   const step = await stepName(ctx, project, note.stepId).catch(() => ({}) as { name?: string; milestoneKey?: string });
-  const updated = await ctx.repo.notes.update(note.id, { archived: false });
   await appendHistory(ctx, {
     type: EV.noteRestored,
     summary: summaryFor(project.code, `${where(step.name)} restored: "${snippet(note.body)}"`),
@@ -127,5 +139,5 @@ export async function restoreNote(ctx: Ctx, input: { projectId: string; noteId: 
     newDisplay: snippet(note.body),
     data: { noteId: note.id, stepName: step.name, milestoneKey: step.milestoneKey, body: note.body },
   });
-  return updated;
+  return ctx.repo.notes.update(note.id, { archived: false });
 }

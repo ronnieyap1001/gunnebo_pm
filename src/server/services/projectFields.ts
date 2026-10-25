@@ -16,7 +16,9 @@ import {
   alreadyLogged,
   appendHistory,
   AppError,
+  dataRef,
   EV,
+  findUnloggedCreate,
   LIBRARY_PREFIX,
   notFound,
   requireName,
@@ -55,21 +57,23 @@ export async function createProjectField(ctx: Ctx, input: CreateProjectFieldInpu
   const choices = prepareChoices(input.choices ?? [], { fieldType, existing: [], withStates: false });
   const config = prepareConfig(input.config);
   const all = await ctx.repo.projectFields.list({ includeArchived: true });
+  const same = all.filter((f) => f.label === label && f.fieldType === fieldType && !f.archived);
   if (await alreadyLogged(ctx)) {
-    const same = all.find((f) => f.label === label && !f.archived);
-    if (same) return same;
+    if (same[0]) return same[0];
   }
-  const data: ProjectFieldInput = {
-    key: slugify(label, all.map((f) => f.key)),
-    label,
-    fieldType,
-    choices,
-    config,
-    order: (all.length ? Math.max(...all.map((f) => f.order)) : 0) + 1,
-    showInSummary: input.showInSummary === true,
-    archived: false,
-  };
-  const field = await ctx.repo.projectFields.create(data);
+  // A retry after a crash between the create and the History row adopts the field the first attempt created.
+  const field =
+    (await findUnloggedCreate(ctx, same, { type: EV.projectFieldCreated, refOf: dataRef("fieldId") })) ??
+    (await ctx.repo.projectFields.create({
+      key: slugify(label, all.map((f) => f.key)),
+      label,
+      fieldType,
+      choices,
+      config,
+      order: (all.length ? Math.max(...all.map((f) => f.order)) : 0) + 1,
+      showInSummary: input.showInSummary === true,
+      archived: false,
+    }));
   await appendHistory(ctx, {
     type: EV.projectFieldCreated,
     summary: fieldSummary(`Added project field "${label}"`),
@@ -244,23 +248,24 @@ export async function archiveProjectField(ctx: Ctx, id: string): Promise<void> {
     throw new AppError("FORBIDDEN", `"${f.label}" is used by the Portfolio filters and can't be archived. You can rename it.`);
   }
   if (f.archived) return;
-  await ctx.repo.projectFields.update(id, { archived: true, archivedAt: ctx.now });
+  // History → field (as for every toggle): a retry with the same opId finishes an interrupted archive with one row.
   await appendHistory(ctx, {
     type: EV.projectFieldArchived,
     summary: fieldSummary(`Archived project field "${f.label}"`),
     data: { fieldId: id, key: f.key },
   });
+  await ctx.repo.projectFields.update(id, { archived: true, archivedAt: ctx.now });
 }
 
 export async function restoreProjectField(ctx: Ctx, id: string): Promise<void> {
   const f = await requireField(ctx, id);
   if (!f.archived) return;
-  await ctx.repo.projectFields.update(id, { archived: false, archivedAt: undefined });
   await appendHistory(ctx, {
     type: EV.projectFieldRestored,
     summary: fieldSummary(`Restored project field "${f.label}"`),
     data: { fieldId: id, key: f.key },
   });
+  await ctx.repo.projectFields.update(id, { archived: false, archivedAt: undefined });
 }
 
 /** Display of a project detail value (summary line, Projects table). */

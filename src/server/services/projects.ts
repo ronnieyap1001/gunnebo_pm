@@ -18,7 +18,6 @@ import {
 import { normalizeValue } from "@/domain/values";
 import type { ProjectInput, Repo, StepInput, StoredStep } from "@/server/repo/types";
 import {
-  alreadyLogged,
   appendHistory,
   AppError,
   EV,
@@ -398,43 +397,47 @@ export async function updateProject(
   }
 
   if (changes.length === 0) return { project: p, changes };
-  if (await alreadyLogged(ctx)) return { project: p, changes: [] };
 
-  const project = await ctx.repo.projects.update(id, update);
+  // The row (with the old values) is written before the project: an old code must reach History for Phase 2 mail
+  // mapping. A retry with the same opId then finishes the project update without a second row.
   const codeChanged = update.code !== undefined;
+  const newCode = update.code ?? p.code;
   await appendHistory(ctx, {
     type: codeChanged ? EV.projectCodeChanged : EV.projectUpdated,
-    summary: summaryFor(project.code, changes.map((c) => `${c.label}: ${c.old} → ${c.new}`).join("; ")),
+    summary: summaryFor(newCode, changes.map((c) => `${c.label}: ${c.old} → ${c.new}`).join("; ")),
     projectId: id,
-    data: { changes, ...(codeChanged ? { oldCode: p.code, newCode: project.code } : {}) },
+    data: { changes, ...(codeChanged ? { oldCode: p.code, newCode } : {}) },
   });
+  const project = await ctx.repo.projects.update(id, update);
   return { project, changes };
 }
 
+/**
+ * Archive / restore write the History row first and then the project, so a retry with the same opId after a crash
+ * between the two finishes the change with exactly one row (a toggle found already done can't tell whose it was).
+ */
 export async function archiveProject(ctx: Ctx, id: string): Promise<Project> {
   const p = await requireProject(ctx.repo, id);
   if (p.archived) return p;
-  const project = await ctx.repo.projects.update(id, { archived: true, archivedAt: ctx.now });
   await appendHistory(ctx, {
     type: EV.projectArchived,
     summary: summaryFor(p.code, "Project archived"),
     projectId: id,
     data: { code: p.code, name: p.name },
   });
-  return project;
+  return ctx.repo.projects.update(id, { archived: true, archivedAt: ctx.now });
 }
 
 export async function restoreProject(ctx: Ctx, id: string): Promise<Project> {
   const p = await requireProject(ctx.repo, id);
   if (!p.archived) return p;
-  const project = await ctx.repo.projects.update(id, { archived: false, archivedAt: undefined });
   await appendHistory(ctx, {
     type: EV.projectRestored,
     summary: summaryFor(p.code, "Project restored"),
     projectId: id,
     data: { code: p.code, name: p.name },
   });
-  return project;
+  return ctx.repo.projects.update(id, { archived: false, archivedAt: undefined });
 }
 
 /**

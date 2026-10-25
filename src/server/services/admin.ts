@@ -48,7 +48,7 @@ export async function setTimeZone(ctx: Ctx, timeZone: string): Promise<void> {
   if (!isValidTimeZone(tz)) throw new AppError("VALIDATION", `"${tz}" is not a time zone this server knows, e.g. Asia/Singapore.`);
   const current = await ctx.repo.settings.get<string>(SETTINGS.timeZone);
   if (current === tz) return;
-  await ctx.repo.settings.set(SETTINGS.timeZone, tz);
+  // History → setting: a retry with the same opId after a crash between the two finishes the change with one row.
   await appendHistory(ctx, {
     type: EV.settingsUpdated,
     summary: summaryFor("Settings", `Time zone: ${current ?? DEFAULT_TIME_ZONE} → ${tz}`),
@@ -56,6 +56,7 @@ export async function setTimeZone(ctx: Ctx, timeZone: string): Promise<void> {
     newDisplay: tz,
     data: { key: SETTINGS.timeZone, old: current ?? null, new: tz },
   });
+  await ctx.repo.settings.set(SETTINGS.timeZone, tz);
 }
 
 /** The name shown as the author of changes and notes. */
@@ -65,7 +66,6 @@ export async function setDisplayName(ctx: Ctx, name: string): Promise<void> {
   if (clean.length > 80) throw new AppError("VALIDATION", "The name is too long (maximum 80 characters).");
   const current = await ctx.repo.settings.get<string>(SETTINGS.displayName);
   if (current === clean) return;
-  await ctx.repo.settings.set(SETTINGS.displayName, clean);
   await appendHistory(ctx, {
     type: EV.settingsUpdated,
     summary: summaryFor("Settings", `Display name: ${current ?? DEFAULT_ACTOR} → ${clean}`),
@@ -73,6 +73,7 @@ export async function setDisplayName(ctx: Ctx, name: string): Promise<void> {
     newDisplay: clean,
     data: { key: SETTINGS.displayName, old: current ?? null, new: clean },
   });
+  await ctx.repo.settings.set(SETTINGS.displayName, clean);
 }
 
 /** Records that a full backup was downloaded (the sidebar warns after 7 days without one). */

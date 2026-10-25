@@ -26,6 +26,7 @@ import {
   alreadyLogged,
   appendHistory,
   AppError,
+  edgeIdForOp,
   EV,
   newId,
   notFound,
@@ -35,7 +36,7 @@ import {
   type HistoryRow,
 } from "./context";
 import { hasChoices, prepareChoices, prepareConfig, requireFieldType, typeLabel, withDefaultStates, type ChoiceInput } from "./definitions";
-import { edgeError, isPosition, MAX_DESCRIPTION_LENGTH, orderAfter } from "./library";
+import { edgeError, isPosition, MAX_DESCRIPTION_LENGTH, orderAfter, viewportWidthOf } from "./library";
 import {
   cellFlowOrder,
   defOf,
@@ -100,7 +101,7 @@ function summaryOf(project: Project, text: string): string {
 }
 
 function suggestClose(step: Step, project: Project, ctx: Ctx): boolean {
-  if (step.milestoneKey !== PROJECT_CLOSED_KEY || step.fieldType !== "DATE" || !step.value) return false;
+  if (step.milestoneKey !== PROJECT_CLOSED_KEY || step.fieldType !== "DATE" || !step.value || step.notApplicable) return false;
   const date = (step.value as DateValue).date;
   return typeof date === "string" && date <= ctx.day.today && project.status !== "CLOSED";
 }
@@ -464,7 +465,7 @@ export async function addProjectStep(ctx: Ctx, input: AddProjectStepInput): Prom
   if (!flow.nodes[step.id]) {
     if (after) {
       const at = flow.nodes[after.id] ?? { x: 0, y: 0 };
-      const pos = input.position ?? { x: at.x + NODE_WIDTH + 40, y: at.y + NODE_HEIGHT + 40 };
+      const pos = isPosition(input.position) ? input.position : { x: at.x + NODE_WIDTH + 40, y: at.y + NODE_HEIGHT + 40 };
       flow = insertAfterInFlow(flow, after.id, step.id, pos, ctx.now, newId);
     } else {
       const placed = all.filter((s) => !s.archived && flow.nodes[s.id]).map((s) => flow.nodes[s.id]);
@@ -710,7 +711,16 @@ async function activeStepsById(ctx: Ctx, projectId: string): Promise<Map<string,
   return new Map(steps.map((s) => [s.id, s]));
 }
 
-/** Draws an arrow between two active steps of the project. AppError CYCLE / DUPLICATE. History `edge.added`. */
+/** Ids for the one arrow an action adds: derived from the opId (a retry adds the same arrow), unless it is taken. */
+function opEdgeIds(ctx: Ctx, flow: Flow): () => string {
+  const id = edgeIdForOp(ctx.opId);
+  return () => (flow.edges.some((e) => e.id === id) ? newId() : id);
+}
+
+/**
+ * Draws an arrow between two active steps of the project. AppError CYCLE / DUPLICATE. History `edge.added`.
+ * History row → flow: a retry with the same opId after a crash between the two adds the same arrow (same id) once.
+ */
 export async function addProjectEdge(ctx: Ctx, projectId: string, from: string, to: string): Promise<FlowEdge> {
   const project = await requireProject(ctx.repo, projectId);
   const steps = await activeStepsById(ctx, projectId);
@@ -722,19 +732,19 @@ export async function addProjectEdge(ctx: Ctx, projectId: string, from: string, 
   let flow = project.flow;
   const missing = [from, to].filter((id) => !flow.nodes[id]);
   if (missing.length) flow = { nodes: { ...flow.nodes, ...defaultPositions(missing, Object.values(flow.nodes)) }, edges: flow.edges };
-  const r = addEdge(flow, from, to, ctx.now, newId);
+  const r = addEdge(flow, from, to, ctx.now, opEdgeIds(ctx, flow));
   if (!r.ok) throw edgeError(r.reason);
-  await ctx.repo.projects.update(projectId, { flow: r.flow });
   await appendHistory(ctx, {
     type: EV.edgeAdded,
     summary: summaryOf(project, `Arrow "${a.name}" → "${b.name}" added`),
     projectId,
     data: { edgeId: r.edge.id, from, to, fromName: a.name, toName: b.name },
   });
+  await ctx.repo.projects.update(projectId, { flow: r.flow });
   return r.edge;
 }
 
-/** Deletes (archives, reason USER) a project arrow. History `edge.archived`. */
+/** Deletes (archives, reason USER) a project arrow. History `edge.archived` (written first, so a retry finishes it). */
 export async function archiveProjectEdge(ctx: Ctx, projectId: string, edgeId: string): Promise<void> {
   const project = await requireProject(ctx.repo, projectId);
   const edge = project.flow.edges.find((e) => e.id === edgeId);
@@ -742,13 +752,13 @@ export async function archiveProjectEdge(ctx: Ctx, projectId: string, edgeId: st
   if (!isActiveEdge(edge)) return;
   const steps = await ctx.repo.steps.listByProject(projectId, { includeArchived: true });
   const name = (id: string) => steps.find((s) => s.id === id)?.name ?? "?";
-  await ctx.repo.projects.update(projectId, { flow: archiveEdge(project.flow, edgeId, ctx.now, "USER") });
   await appendHistory(ctx, {
     type: EV.edgeArchived,
     summary: summaryOf(project, `Arrow "${name(edge.from)}" → "${name(edge.to)}" removed`),
     projectId,
     data: { edgeId, from: edge.from, to: edge.to, fromName: name(edge.from), toName: name(edge.to) },
   });
+  await ctx.repo.projects.update(projectId, { flow: archiveEdge(project.flow, edgeId, ctx.now, "USER") });
 }
 
 /** Auto-layout of the project's active steps. No History. */
@@ -759,7 +769,7 @@ export async function layoutProject(
 ): Promise<Flow> {
   const project = await requireProject(ctx.repo, projectId);
   const ids = cellFlowOrder(project.cells ?? {}, project.flow);
-  const positions = autoLayout(ids, project.flow.edges, { wrap: opts.wrap, viewportWidth: opts.viewportWidth });
+  const positions = autoLayout(ids, project.flow.edges, { wrap: opts.wrap === true, viewportWidth: viewportWidthOf(opts.viewportWidth) });
   const flow: Flow = { nodes: { ...project.flow.nodes, ...positions }, edges: project.flow.edges };
   await ctx.repo.projects.update(projectId, { flow });
   return flow;

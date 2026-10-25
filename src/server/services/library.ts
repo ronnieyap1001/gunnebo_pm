@@ -24,7 +24,9 @@ import {
   alreadyLogged,
   appendHistory,
   AppError,
+  edgeIdForOp,
   EV,
+  findUnloggedCreate,
   LIBRARY_PREFIX,
   newId,
   notFound,
@@ -154,36 +156,44 @@ export async function createMilestone(ctx: Ctx, input: CreateMilestoneInput): Pr
   const choices = prepareChoices(input.choices ?? [], { fieldType, existing: [], withStates: true });
 
   const template = await getTemplate(ctx.repo);
+  const same = template.milestones.filter((m) => !m.archived && m.name === name && m.fieldType === fieldType);
   if (await alreadyLogged(ctx)) {
     // Retried action: return the milestone the first attempt created.
-    const same = template.milestones.filter((m) => m.name === name).sort((a, b) => (a.createdAt < b.createdAt ? 1 : -1));
-    if (same[0]) return same[0];
+    const done = [...same].sort((a, b) => (a.createdAt < b.createdAt ? 1 : -1))[0];
+    if (done) return done;
   }
 
   const after = input.afterMilestoneId ? template.milestones.find((m) => m.id === input.afterMilestoneId) : undefined;
   if (input.afterMilestoneId && (!after || after.archived)) throw notFound("The milestone to insert after");
 
-  const orders = template.milestones.filter((m) => !m.archived).map((m) => m.order);
-  const order = after ? orderAfter(after.order, orders) : (orders.length ? Math.max(...orders) : 0) + 1;
-  const key = slugify(name, template.milestones.map((m) => m.key));
-
-  const data: MilestoneInput = { key, name, description, fieldType, choices, config, order, archived: false };
-  const milestone = await ctx.repo.milestones.create(data);
+  // A retry after a crash between the create and the History row adopts the milestone the first attempt created
+  // (and finishes its node, the revision and the row) instead of adding a second "BOM-2".
+  let milestone = await findUnloggedCreate(ctx, same, { type: EV.milestoneCreated, refOf: (e) => e.milestoneId });
+  if (!milestone) {
+    const orders = template.milestones.filter((m) => !m.archived).map((m) => m.order);
+    const order = after ? orderAfter(after.order, orders) : (orders.length ? Math.max(...orders) : 0) + 1;
+    const key = slugify(name, template.milestones.map((m) => m.key));
+    const data: MilestoneInput = { key, name, description, fieldType, choices, config, order, archived: false };
+    milestone = await ctx.repo.milestones.create(data);
+  }
+  const key = milestone.key;
 
   let flow = template.flow;
-  const activeIds = new Set(template.milestones.filter((m) => !m.archived).map((m) => m.id));
-  if (after) {
-    const at = flow.nodes[after.id] ?? { x: 0, y: 0 };
-    const pos = input.position ?? { x: at.x + NODE_WIDTH + 40, y: at.y + NODE_HEIGHT + 40 };
-    flow = insertAfterInFlow(flow, after.id, milestone.id, pos, ctx.now, edgeIdFactory());
-  } else {
-    const placed = Object.entries(flow.nodes)
-      .filter(([id]) => activeIds.has(id))
-      .map(([, p]) => p);
-    const pos = input.position ?? defaultPositions([milestone.id], placed)[milestone.id];
-    flow = { nodes: { ...flow.nodes, [milestone.id]: { x: pos.x, y: pos.y } }, edges: flow.edges };
+  if (!flow.nodes[milestone.id]) {
+    const activeIds = new Set(template.milestones.filter((m) => !m.archived).map((m) => m.id));
+    if (after) {
+      const at = flow.nodes[after.id] ?? { x: 0, y: 0 };
+      const pos = isPosition(input.position) ? input.position : { x: at.x + NODE_WIDTH + 40, y: at.y + NODE_HEIGHT + 40 };
+      flow = insertAfterInFlow(flow, after.id, milestone.id, pos, ctx.now, edgeIdFactory());
+    } else {
+      const placed = Object.entries(flow.nodes)
+        .filter(([id]) => activeIds.has(id))
+        .map(([, p]) => p);
+      const pos = isPosition(input.position) ? input.position : defaultPositions([milestone.id], placed)[milestone.id];
+      flow = { nodes: { ...flow.nodes, [milestone.id]: { x: pos.x, y: pos.y } }, edges: flow.edges };
+    }
+    await saveTemplateFlow(ctx, flow);
   }
-  await saveTemplateFlow(ctx, flow);
   const revision = await bumpTemplateRevision(ctx);
 
   await appendHistory(
@@ -256,7 +266,6 @@ export async function updateMilestone(ctx: Ctx, id: string, patch: MilestonePatc
 
   const changes = describeDefChanges(before, after);
   if (changes.length === 0) return m;
-  if (await alreadyLogged(ctx)) return m;
 
   const update: Partial<MilestoneInput> = {};
   if (after.name !== before.name) update.name = after.name;
@@ -265,8 +274,10 @@ export async function updateMilestone(ctx: Ctx, id: string, patch: MilestonePatc
   if (!choicesEqual(after.choices, before.choices)) update.choices = after.choices;
   if (stableStringify(after.config) !== stableStringify(before.config)) update.config = after.config;
 
-  const updated = await ctx.repo.milestones.update(id, update);
-  const revision = await bumpTemplateRevision(ctx);
+  // Write order: revision → History (with the old definition) → milestone. The old definition exists nowhere else,
+  // so an interrupted edit must not lose it; a retry with the same opId finishes the milestone update only.
+  const logged = await alreadyLogged(ctx);
+  const revision = logged ? await readTemplateRevision(ctx.repo) : await bumpTemplateRevision(ctx);
   const onlyRename = Object.keys(update).length === 1 && update.name !== undefined;
   await appendHistory(ctx, {
     type: EV.milestoneUpdated,
@@ -277,7 +288,7 @@ export async function updateMilestone(ctx: Ctx, id: string, patch: MilestonePatc
     newDisplay: onlyRename ? after.name : undefined,
     data: { milestoneKey: m.key, changes, old: pick(before, update), new: pick(after, update), revision },
   });
-  return updated;
+  return ctx.repo.milestones.update(id, update);
 }
 
 function pick(def: DefSnapshot, keys: Partial<MilestoneInput>): Partial<DefSnapshot> {
@@ -342,26 +353,29 @@ export async function applyChoicesTo(ctx: Ctx, sourceId: string, targetIds: stri
     if (t.archived) throw new AppError("VALIDATION", `"${t.name}" is archived.`);
     if (!hasChoices(t.fieldType)) throw new AppError("VALIDATION", `"${t.name}" is not a Dropdown or Multiple field.`);
   }
-  if (await alreadyLogged(ctx)) return { updatedIds: [] };
-
-  const updatedIds: string[] = [];
-  const names: string[] = [];
-  for (const t of targets) {
-    const next = copyChoicesInto(source.choices ?? [], t.choices ?? [], t.fieldType);
-    if (choicesEqual(next, t.choices ?? [])) continue;
-    await ctx.repo.milestones.update(t.id, { choices: next });
-    updatedIds.push(t.id);
-    names.push(t.name);
-  }
-  if (updatedIds.length === 0) return { updatedIds };
-  const revision = await bumpTemplateRevision(ctx);
+  const changes = targets
+    .map((t) => ({ t, next: copyChoicesInto(source.choices ?? [], t.choices ?? [], t.fieldType) }))
+    .filter(({ t, next }) => !choicesEqual(next, t.choices ?? []));
+  if (changes.length === 0) return { updatedIds: [] };
+  const updatedIds = changes.map(({ t }) => t.id);
+  const names = changes.map(({ t }) => t.name);
+  // Revision → History → milestones: a retry with the same opId after a crash at any point finishes the copy.
+  const revision = (await alreadyLogged(ctx)) ? await readTemplateRevision(ctx.repo) : await bumpTemplateRevision(ctx);
   await appendHistory(ctx, {
     type: EV.milestoneUpdated,
     summary: lib(`Copied the choices of "${source.name}" to ${names.map((n) => `"${n}"`).join(", ")}`),
     milestoneId: source.id,
     milestoneKey: source.key,
-    data: { milestoneKey: source.key, sourceId, targetIds: updatedIds, targetNames: names, revision },
+    data: {
+      milestoneKey: source.key,
+      sourceId,
+      targetIds: updatedIds,
+      targetNames: names,
+      old: Object.fromEntries(changes.map(({ t }) => [t.id, t.choices ?? []])),
+      revision,
+    },
   });
+  for (const { t, next } of changes) await ctx.repo.milestones.update(t.id, { choices: next });
   return { updatedIds };
 }
 
@@ -398,9 +412,8 @@ export async function reorderMilestone(
   const before = templateFlowOrder(template);
   const reordered: Template = { ...template, milestones: template.milestones.map((x) => (x.id === id ? { ...x, order } : x)) };
   const effective = templateFlowOrder(reordered).join("|") !== before.join("|");
-  if (await alreadyLogged(ctx)) return { milestone: m, effective };
 
-  const updated = await ctx.repo.milestones.update(id, { order });
+  // History → milestone: a retry with the same opId after a crash between the two finishes the move with one row.
   await appendHistory(ctx, {
     type: EV.milestoneReordered,
     summary: lib(`Moved "${m.name}" in the list`),
@@ -408,6 +421,7 @@ export async function reorderMilestone(
     milestoneKey: m.key,
     data: { milestoneKey: m.key, oldOrder: m.order, newOrder: order, effective },
   });
+  const updated = await ctx.repo.milestones.update(id, { order });
   return { milestone: updated, effective };
 }
 
@@ -551,6 +565,11 @@ export async function moveTemplateNodes(ctx: Ctx, positions: Record<string, Posi
   if (changed) await saveTemplateFlow(ctx, { nodes, edges: flow.edges });
 }
 
+/** A browser-reported canvas width, or undefined (the layout's default) when it is not a sensible number. */
+export function viewportWidthOf(raw: unknown): number | undefined {
+  return typeof raw === "number" && Number.isFinite(raw) && raw >= 200 && raw <= 20_000 ? raw : undefined;
+}
+
 export function isPosition(p: unknown): p is Position {
   return (
     !!p &&
@@ -562,7 +581,10 @@ export function isPosition(p: unknown): p is Position {
   );
 }
 
-/** Draws an arrow `from -> to` between active milestones. AppError CYCLE / DUPLICATE. Revision + 1. */
+/**
+ * Draws an arrow `from -> to` between active milestones. AppError CYCLE / DUPLICATE. Revision + 1.
+ * Revision → History → flow, with an opId-derived arrow id: a retry with the same opId adds the same arrow once.
+ */
 export async function addTemplateEdge(ctx: Ctx, from: string, to: string): Promise<FlowEdge> {
   const template = await getTemplate(ctx.repo);
   const a = template.milestones.find((m) => m.id === from && !m.archived);
@@ -570,16 +592,18 @@ export async function addTemplateEdge(ctx: Ctx, from: string, to: string): Promi
   if (!a || !b) throw notFound("One end of the arrow");
   const flow = ensureNodes(template.flow, [from, to]);
   const existing = flow.edges.find((e) => isActiveEdge(e) && e.from === from && e.to === to);
-  if (existing && (await alreadyLogged(ctx))) return existing;
-  const r = addEdge(flow, from, to, ctx.now, edgeIdFactory());
+  const logged = await alreadyLogged(ctx);
+  if (existing && logged) return existing;
+  const id = edgeIdForOp(ctx.opId);
+  const r = addEdge(flow, from, to, ctx.now, () => (flow.edges.some((e) => e.id === id) ? newId() : id));
   if (!r.ok) throw edgeError(r.reason);
-  await saveTemplateFlow(ctx, r.flow);
-  const revision = await bumpTemplateRevision(ctx);
+  const revision = logged ? await readTemplateRevision(ctx.repo) : await bumpTemplateRevision(ctx);
   await appendHistory(ctx, {
     type: EV.templateEdgeAdded,
     summary: lib(`Arrow "${a.name}" → "${b.name}" added`),
     data: { edgeId: r.edge.id, from, to, fromName: a.name, toName: b.name, revision },
   });
+  await saveTemplateFlow(ctx, r.flow);
   return r.edge;
 }
 
@@ -595,28 +619,28 @@ export function edgeError(reason: "SELF" | "DUPLICATE" | "CYCLE" | "MISSING_NODE
   }
 }
 
-/** Deletes (archives) a template arrow, reason USER. Revision + 1. */
+/** Deletes (archives) a template arrow, reason USER. Revision + 1. Revision → History → flow (a retry finishes it). */
 export async function archiveTemplateEdge(ctx: Ctx, edgeId: string): Promise<void> {
   const template = await getTemplate(ctx.repo);
   const edge = template.flow.edges.find((e) => e.id === edgeId);
   if (!edge) throw notFound("This arrow");
   if (!isActiveEdge(edge)) return;
   const flow = archiveEdge(template.flow, edgeId, ctx.now, "USER");
-  await saveTemplateFlow(ctx, flow);
-  const revision = await bumpTemplateRevision(ctx);
+  const revision = (await alreadyLogged(ctx)) ? await readTemplateRevision(ctx.repo) : await bumpTemplateRevision(ctx);
   const name = (id: string) => template.milestones.find((m) => m.id === id)?.name ?? "?";
   await appendHistory(ctx, {
     type: EV.templateEdgeArchived,
     summary: lib(`Arrow "${name(edge.from)}" → "${name(edge.to)}" removed`),
     data: { edgeId, from: edge.from, to: edge.to, fromName: name(edge.from), toName: name(edge.to), revision },
   });
+  await saveTemplateFlow(ctx, flow);
 }
 
 /** Auto-layout of the active template nodes (left to right, optionally wrapped). No history, no revision. */
 export async function layoutTemplate(ctx: Ctx, opts: { wrap?: boolean; viewportWidth?: number } = {}): Promise<Flow> {
   const template = await getTemplate(ctx.repo);
   const ids = templateFlowOrder(template);
-  const positions = autoLayout(ids, template.flow.edges, { wrap: opts.wrap, viewportWidth: opts.viewportWidth });
+  const positions = autoLayout(ids, template.flow.edges, { wrap: opts.wrap === true, viewportWidth: viewportWidthOf(opts.viewportWidth) });
   const flow: Flow = { nodes: { ...template.flow.nodes, ...positions }, edges: template.flow.edges };
   await saveTemplateFlow(ctx, flow);
   return flow;
