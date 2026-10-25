@@ -36,6 +36,19 @@ export function isHttpUrl(text: string): boolean {
   }
 }
 
+/**
+ * Reads what someone typed in a percent box: "45", "12.5", "12,5", "80 %". Rounds to a whole percent.
+ * Empty means 0. Returns null for anything that is not a number from 0 to 100.
+ */
+export function parsePercentInput(text: string): number | null {
+  if (!text.trim()) return 0;
+  const t = text.trim().replace(/\s*%$/, "").replace(",", ".");
+  if (!/^\d+(\.\d*)?$|^\.\d+$/.test(t)) return null;
+  const n = Number(t);
+  if (!Number.isFinite(n) || n > 100) return null;
+  return Math.round(n);
+}
+
 const ymdSchema = z.string().refine(isValidYmd, { message: "must be a valid date (YYYY-MM-DD)" });
 
 const textSchema = z.strictObject({ text: z.string() });

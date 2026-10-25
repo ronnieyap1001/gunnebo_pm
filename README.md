@@ -20,10 +20,11 @@ You only do this once. Nothing here needs a terminal.
 2. Name it **Gunnebo PM app**, pick your workspace (**Ron Yap's Notion**) and keep the type **Internal**.
 3. Click **Save**, then on the next screen click **Show** next to **Internal Integration Secret** and copy it.
    Keep it somewhere safe for step 2. It starts with `ntn_`.
-4. In Notion, create two empty pages at the top level of your sidebar, named exactly:
+4. The two pages the app needs are already in your Notion, inside the page **Gunnebo**:
    - **Gunnebo PM** (your real data)
    - **Gunnebo PM (Preview)** (test data for preview versions while the app is being built)
-5. On each of those two pages, click **•••** at the top right, then **Connections**, then add **Gunnebo PM app**.
+5. Open each of those two pages, click **•••** at the top right, then **Connections**, then add **Gunnebo PM app**.
+   Connect only these two pages, not **Gunnebo** itself, so the app can't see anything else.
 
 > Your workspace must have only one member (you), or be on a paid Notion plan. Notion limits free workspaces with
 > several members to 1,000 blocks created by apps, which this app would use up after about ten projects.
@@ -39,12 +40,21 @@ You only do this once. Nothing here needs a terminal.
    | Name | Value |
    |---|---|
    | `NOTION_TOKEN` | the secret you copied in step 1 |
-   | `APP_PASSWORD` | the password you will sign in with: at least 16 characters, for example four random words |
+   | `APP_PASSWORD` | the password you will sign in with: at least 16 characters. Let a password manager generate it (for example five random words). Don't make one up yourself: "Gunnebo Kunshan 2026" is easy to guess |
 
 4. Click **Deploy** and wait about two minutes.
-5. **Strongly recommended:** in the project, open **Settings**, then **Deployment Protection**, set
-   **Vercel Authentication** to **All Deployments** and save. Then only someone signed in to your Vercel account can
-   even see the sign-in page. It's free.
+5. **Lock the front door (do this, it's free):** in the project, open **Settings**, then **Deployment Protection**.
+   Turn on **Vercel Authentication**, choose **All Deployments** and click **Save**. Now only someone signed in to
+   your Vercel account can even see the app's sign-in page.
+6. **Limit password guessing (free):** in the project, open **Firewall**, click **Configure**, then **+ New Rule**.
+   - Name: `Sign-in limit`
+   - If **Request Path** **Equals** `/login` **and** **Method** **Equals** `POST`
+   - Then **Rate Limit**: **Fixed Window**, time window **10 mins**, request limit **10**, key **IP**, action
+     **Default (429)**
+   - Click **Save Rule**, then **Review Changes** and **Publish**.
+
+`NOTION_PARENT_PAGE_ID` is not needed. Add it only if Setup says several Notion pages are called "Gunnebo PM": paste
+the link of the right page and tick **Production** only. Preview versions always use **Gunnebo PM (Preview)**.
 
 ### 3. First visit
 
@@ -95,6 +105,13 @@ Press **?** anywhere to see keyboard shortcuts. **Ctrl+K** (or **⌘K** on a Mac
 - **Vercel plan:** Vercel's free Hobby plan is meant for personal, non-commercial use. For work use Vercel expects
   the Pro plan. The app works the same on both.
 - **Company policy:** check that Gunnebo allows customer project data in your Notion workspace and on Vercel.
+- **One password:** everyone who uses the app shares one password, and History records changes as "Me".
+  Personal Microsoft sign-in is planned for Phase 2.
+- **Very long texts:** a milestone can hold up to 50,000 characters. When a very long text is replaced, History
+  keeps only the first 2,000 characters of the old version.
+- **Sign out everywhere after Start over:** **Start over** resets the app's settings, so a session that was signed
+  out with **Sign out everywhere** before it could work again. If you used Sign out everywhere because of a lost
+  device, change `APP_PASSWORD` instead, which always signs everyone out.
 
 ## If something goes wrong
 
@@ -102,8 +119,10 @@ Press **?** anywhere to see keyboard shortcuts. **Ctrl+K** (or **⌘K** on a Mac
 |---|---|
 | "Gunnebo PM needs one more setting" | Add the missing variable in Vercel (Settings → Environment Variables), then **Deployments → ⋯ → Redeploy** |
 | Setup says the Notion page isn't connected | In Notion, open **Gunnebo PM**, **••• → Connections**, add **Gunnebo PM app**, then click **Check again** |
-| "Notion is busy" | Wait a minute. The app resumes by itself |
+| "Notion is busy" or "Notion didn't answer in time" | Wait a minute and click **Try again**. Long jobs resume by themselves |
+| "Too many wrong passwords" | Wait 15 minutes, then sign in again |
 | You forgot the password | Change `APP_PASSWORD` in Vercel and redeploy |
+| You lost a laptop or phone that was signed in | **Settings → Sign out everywhere**. To be completely sure, also change `APP_PASSWORD` and redeploy |
 | You think someone else has your password | Change `APP_PASSWORD`, then in Notion regenerate the integration secret and update `NOTION_TOKEN`. Redeploy |
 
 ---

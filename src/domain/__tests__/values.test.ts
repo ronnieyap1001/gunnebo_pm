@@ -1,6 +1,6 @@
 import { describe, expect, it } from "vitest";
 import { FIELD_TYPES, type Choice, type FieldDef, type FieldType, type Value } from "@/domain/types";
-import { isEmptyValue, isHttpUrl, isValidValue, normalizeValue, valueSchema } from "@/domain/values";
+import { isEmptyValue, isHttpUrl, isValidValue, normalizeValue, parsePercentInput, valueSchema } from "@/domain/values";
 
 const CHOICES: Choice[] = [
   { id: "packing-list", label: "Packing list" },
@@ -207,5 +207,28 @@ describe("isHttpUrl", () => {
     ["https://a b.com", false],
   ])("%s -> %s", (url, expected) => {
     expect(isHttpUrl(url)).toBe(expected);
+  });
+});
+
+describe("parsePercentInput", () => {
+  it.each([
+    ["", 0],
+    ["0", 0],
+    ["45", 45],
+    ["12.5", 13],
+    ["12,5", 13],
+    ["12.4", 12],
+    [".5", 1],
+    ["99.6", 100],
+    ["100", 100],
+    ["80 %", 80],
+    ["80%", 80],
+    ["  7 ", 7],
+  ])("%j -> %s", (input, expected) => {
+    expect(parsePercentInput(input)).toBe(expected);
+  });
+
+  it.each(["150", "100.5", "-5", "abc", "1.2.3", "12,5,1", "%", "1e2"])("%j is refused", (input) => {
+    expect(parsePercentInput(input)).toBeNull();
   });
 });

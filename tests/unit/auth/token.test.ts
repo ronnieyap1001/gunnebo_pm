@@ -111,7 +111,28 @@ describe("safeNextPath", () => {
     ["/\\evil.example", "/portfolio"],
     ["https://evil.example", "/portfolio"],
     ["/login?next=/x", "/portfolio"],
-  ])("%s -> %s", (input, expected) => {
+    // Browsers strip tab/newline/CR from URLs, so these would become "//evil.example".
+    ["/\t/evil.example", "/portfolio"],
+    ["/\n/evil.example", "/portfolio"],
+    ["/\r/evil.example", "/portfolio"],
+    ["/\u0000/evil.example", "/portfolio"],
+    ["/\u007f/evil.example", "/portfolio"],
+    // Percent-encoded tab stays a path segment on this site.
+    ["/%09/evil", "/%09/evil"],
+    ["/./login", "/portfolio"],
+    ["/login/../portfolio#top", "/portfolio#top"],
+    ["/" + "a".repeat(2001), "/portfolio"],
+  ])("%j -> %s", (input, expected) => {
     expect(safeNextPath(input as string | undefined)).toBe(expected);
+  });
+
+  it("never returns something a browser would read as another site", () => {
+    const tricky = ["/\t/x.example", "/\\/x.example", "/%2F/x.example", "/%5C/x.example", "/..//x.example", "/.//x.example"];
+    for (const input of tricky) {
+      const out = safeNextPath(input);
+      expect(out.startsWith("/")).toBe(true);
+      expect(out.startsWith("//")).toBe(false);
+      expect(new URL(out, "https://app.example").origin).toBe("https://app.example");
+    }
   });
 });

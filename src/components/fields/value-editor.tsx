@@ -18,6 +18,7 @@ import type {
   Ymd,
 } from "@/domain/types";
 import { addDays, formatYmd, fromYmdLocal, isValidYmd, parseDateInput, toYmdLocal } from "@/domain/dates";
+import { parsePercentInput } from "@/domain/values";
 import { cn } from "@/lib/utils";
 import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
@@ -362,17 +363,29 @@ function PercentEditor({ value, onCommit, disabled, autoFocus, label }: ValueEdi
   const committed = (value as PercentValue | null)?.percent ?? 0;
   const [local, setLocal] = useState(committed);
   const [text, setText] = useState(String(committed));
+  const [invalid, setInvalid] = useState(false);
   useEffect(() => {
     setLocal(committed);
     setText(String(committed));
+    setInvalid(false);
   }, [committed]);
   const commit = (n: number) => {
     const clamped = Math.max(0, Math.min(100, Math.round(n)));
     setLocal(clamped);
     setText(String(clamped));
+    setInvalid(false);
     // Leaving an empty value at 0 is not a change (no write, no History row).
     if (value === null && clamped === 0) return;
     if (clamped !== committed || value === null) onCommit({ percent: clamped });
+  };
+  // Typed text: "12.5" saves 13, "150" or "abc" saves nothing and shows a hint.
+  const commitText = () => {
+    const n = parsePercentInput(text);
+    if (n === null) {
+      setInvalid(true);
+      return;
+    }
+    commit(n);
   };
   return (
     <div className="space-y-3">
@@ -393,20 +406,25 @@ function PercentEditor({ value, onCommit, disabled, autoFocus, label }: ValueEdi
         <div className="flex items-center gap-1">
           <Input
             value={text}
-            inputMode="numeric"
-            onChange={(e) => setText(e.target.value.replace(/[^\d]/g, ""))}
-            onBlur={() => commit(Number(text || 0))}
+            inputMode="decimal"
+            onChange={(e) => {
+              setText(e.target.value.replace(/[^\d.,%\s]/g, ""));
+              setInvalid(false);
+            }}
+            onBlur={commitText}
             onKeyDown={(e) => {
-              if (e.key === "Enter") commit(Number(text || 0));
+              if (e.key === "Enter") commitText();
             }}
             className="h-8 w-16 text-right tabular-nums"
             disabled={disabled}
             autoFocus={autoFocus}
             aria-label={label ? `${label}: percent` : "Percent"}
+            aria-invalid={invalid || undefined}
           />
           <span className="text-sm text-muted-foreground">%</span>
         </div>
       </div>
+      {invalid ? <p className="text-xs text-destructive">Enter a number from 0 to 100.</p> : null}
       <div className="flex gap-1">
         {[0, 25, 50, 75, 100].map((n) => (
           <Button key={n} variant={local === n ? "secondary" : "outline"} size="sm" className="h-7 flex-1" disabled={disabled} onClick={() => commit(n)}>

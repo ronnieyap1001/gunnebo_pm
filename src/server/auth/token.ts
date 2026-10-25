@@ -130,8 +130,20 @@ export function checkPassword(input: string, env: Env = process.env): boolean {
 
 /** Only allow same-site relative paths as login redirect targets. */
 export function safeNextPath(next: string | null | undefined): string {
-  if (!next || typeof next !== "string") return "/portfolio";
-  if (!next.startsWith("/") || next.startsWith("//") || next.startsWith("/\\")) return "/portfolio";
-  if (next.startsWith("/login")) return "/portfolio";
-  return next;
+  const fallback = "/portfolio";
+  if (!next || typeof next !== "string" || next.length > 2000) return fallback;
+  // Control characters (tab, newline) and backslashes are stripped or rewritten by browsers' URL parsers,
+  // which can turn "/\t/evil.example" into "//evil.example". Refuse them outright.
+  if (!next.startsWith("/") || /[\u0000-\u001f\u007f\\]/.test(next)) return fallback;
+  let url: URL;
+  try {
+    url = new URL(next, "http://local.invalid");
+  } catch {
+    return fallback;
+  }
+  if (url.origin !== "http://local.invalid") return fallback;
+  // Dot segments can normalise "/.//evil.example" into "//evil.example", which browsers read as another site.
+  if (url.pathname.startsWith("//")) return fallback;
+  if (url.pathname === "/login" || url.pathname.startsWith("/login/")) return fallback;
+  return url.pathname + url.search + url.hash;
 }

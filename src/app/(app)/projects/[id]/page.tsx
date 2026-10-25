@@ -1,6 +1,7 @@
 import type { Metadata } from "next";
 import { notFound } from "next/navigation";
 import { cache } from "react";
+import { requireUser } from "@/server/auth/session";
 import { requireReadyStorage } from "@/server/guards";
 import { getCachedAppSettings, getDay, getProjectPageData, scheduleReconcile } from "@/server/queries";
 import { getRepo } from "@/server/repo";
@@ -23,6 +24,7 @@ const load = cache(async (id: string) => {
 });
 
 export async function generateMetadata({ params }: { params: Promise<{ id: string }> }): Promise<Metadata> {
+  await requireUser();
   const { id } = await params;
   try {
     const { data } = await load(id);
