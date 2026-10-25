@@ -32,3 +32,6 @@ coverage/
 .vercel
 *.pem
 npm-debug.log*
+
+# Extra local build folders
+/.next-*/

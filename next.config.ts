@@ -13,6 +13,8 @@ const nextConfig: NextConfig = {
   // Every page reads live, signed-in data from Notion, so pages render per request.
   // Library/template data is cached explicitly with unstable_cache + tags (see src/server/cache.ts).
   cacheComponents: false,
+  // Lets several local dev servers run side by side (each with its own NEXT_DIST_DIR). Vercel uses the default.
+  distDir: process.env.NEXT_DIST_DIR || ".next",
   poweredByHeader: false,
   devIndicators: false,
   experimental: {

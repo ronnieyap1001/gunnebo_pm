@@ -48,3 +48,29 @@ building blocks so every screen looks and behaves the same.
 
 ## Command palette
 ⌘K / Ctrl+K: projects, milestones of the current project, actions (New project, Export, Sync, Backup, Toggle theme).
+
+## Infrastructure that already exists (use it, don't rebuild it)
+
+- **Server Actions:** wrap every action body in `runAction(opId, (ctx) => service(ctx, …), { tags })` from
+  `@/server/actions/run` (sign-in check, context with Singapore "today", cache tag refresh, plain-English
+  `ActionResult`). Read-only lazy loads use `runQuery(() => …)`. Never throw from an action.
+- **One opId per user action**, created in the browser with `newOpId()` (`@/lib/write-queue`). If a write fails with
+  a network error or BUSY, retry it **with the same opId** (services are idempotent per opId; History may already
+  hold the row). Writes to one project go through `enqueue(projectId, task)`.
+- **Long jobs** (create project, sync, import/seed/reset, bulk N/A > 16, repair mirrors, backup paging, verify
+  history): `runJob(() => continueAction(opId))` from `@/lib/run-job` with `<ProgressDialog>`.
+- **Guard:** pages that read project/library data call `await requireReadyStorage()` (`@/server/guards`) first;
+  it redirects to /setup until the databases exist and the milestones are loaded. /setup itself must not call it.
+- **Queries** (screen data, already tested): `@/server/queries` (see `docs/API.md` and the DTO types exported by
+  `src/server/queries/*.ts`). The project page should call `scheduleReconcile(id)` after loading.
+- **Business functions:** `@/server/services` (see `docs/API.md`).
+- **Components:** `NodeCard`/`NODE_TYPES` and `FlowCanvas`/`FlowProvider`/`useFlowControls`
+  (`src/components/flow`), `ValueEditor` + `DateField` (`src/components/fields/value-editor.tsx`),
+  `DefinitionEditor` (`src/components/library/definition-editor.tsx`), `StateBadge`/`StateDot`/`StateIcon`/
+  `StateLegend`/`stateClass` (`src/components/state/state-badge.tsx`), `SidePanel`, `PageHeader`, `ConfirmDialog`,
+  `ProgressDialog`, `EmptyState`, `useHotkeys`, shadcn/ui in `src/components/ui`.
+- **Local data for trying screens:** `npx tsx --conditions=react-server scripts/dev-seed.ts --file <json> --demo`
+  creates the schema, the 64 milestones and 4 demo projects in a fake-Notion file. Run the app against it with
+  `APP_PASSWORD="local dev password 1234" FAKE_NOTION_FILE=<json> npx next dev -p <port>` and sign in with that password.
+  Chromium + Playwright are installed (`require('playwright')`, `chromium.launch()`), so you can drive and
+  screenshot the page yourself to check it works.

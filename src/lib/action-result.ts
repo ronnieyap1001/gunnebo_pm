@@ -1,14 +1,14 @@
 /** Shape every Server Action returns. Never throw raw errors to the client. */
 export type ActionResult<T = undefined> =
   | { ok: true; data: T }
-  | { ok: false; error: string; code?: string };
+  | { ok: false; error: string; code?: string; details?: Record<string, unknown> };
 
 export function ok<T>(data: T): ActionResult<T> {
   return { ok: true, data };
 }
 
-export function fail(error: string, code?: string): ActionResult<never> {
-  return { ok: false, error, code };
+export function fail(error: string, code?: string, details?: Record<string, unknown>): ActionResult<never> {
+  return details ? { ok: false, error, code, details } : { ok: false, error, code };
 }
 
 /** True when a thrown client-side error means the deployment changed under an open tab. */
