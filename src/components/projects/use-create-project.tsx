@@ -98,7 +98,7 @@ export function useCreateProject(opts: { onStopped?: () => void } = {}) {
           window.setTimeout(() => window.location.reload(), 800);
           return false;
         }
-        if (result.code !== "BUSY" && result.code !== "SESSION") setJobParams(null);
+        if (result.code !== "BUSY" && result.code !== "NETWORK" && result.code !== "SESSION") setJobParams(null);
         toastFailure(result, {
           title: `Creating ${job.code} stopped`,
           retry: () => void run(job),

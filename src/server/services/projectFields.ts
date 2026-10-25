@@ -43,6 +43,13 @@ function fieldSummary(text: string): string {
   return summaryFor(LIBRARY_PREFIX, text);
 }
 
+/** Two active fields with the same name would be indistinguishable on forms and in the Portfolio filters. */
+function assertLabelFree(all: ProjectField[], label: string, exceptId?: string): void {
+  const wanted = label.trim().toLowerCase();
+  const dup = all.find((f) => !f.archived && f.id !== exceptId && f.label.trim().toLowerCase() === wanted);
+  if (dup) throw new AppError("VALIDATION", `There is already a project field called "${dup.label}". Choose another name.`);
+}
+
 export interface CreateProjectFieldInput {
   label: string;
   fieldType: FieldType;
@@ -62,8 +69,10 @@ export async function createProjectField(ctx: Ctx, input: CreateProjectFieldInpu
     if (same[0]) return same[0];
   }
   // A retry after a crash between the create and the History row adopts the field the first attempt created.
+  const adopted = await findUnloggedCreate(ctx, same, { type: EV.projectFieldCreated, refOf: dataRef("fieldId") });
+  if (!adopted) assertLabelFree(all, label);
   const field =
-    (await findUnloggedCreate(ctx, same, { type: EV.projectFieldCreated, refOf: dataRef("fieldId") })) ??
+    adopted ??
     (await ctx.repo.projectFields.create({
       key: slugify(label, all.map((f) => f.key)),
       label,
@@ -145,6 +154,7 @@ export async function updateProjectField(ctx: Ctx, id: string, patch: ProjectFie
   if (patch.label !== undefined) {
     const label = requireName(patch.label, "The field name");
     if (label !== f.label) {
+      assertLabelFree(await ctx.repo.projectFields.list({ includeArchived: true }), label, f.id);
       next.label = label;
       changes.push(`renamed "${f.label}" → "${label}"`);
     }

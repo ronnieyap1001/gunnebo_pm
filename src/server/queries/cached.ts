@@ -137,7 +137,14 @@ export function getTemplateSnapshots(cursor: string | null = null) {
 
 /** Never cached: Setup decides whether the app can run at all. */
 export function getSetupStatus(): Promise<setupQ.SetupStatusDTO> {
-  return setupQ.getSetupStatus(getStorageAdmin(), getRepo());
+  // getRepo() throws while Notion isn't configured (no NOTION_TOKEN on Vercel); the admin still reports that state.
+  let repo: ReturnType<typeof getRepo> | undefined;
+  try {
+    repo = getRepo();
+  } catch {
+    repo = undefined;
+  }
+  return setupQ.getSetupStatus(getStorageAdmin(), repo);
 }
 
 export function getSettingsData(): Promise<setupQ.SettingsData> {

@@ -25,7 +25,8 @@ export async function readSession(): Promise<SessionPayload | null> {
   const session = verifySession(cfg.key, jar.get(sessionCookieName())?.value, Math.floor(Date.now() / 1000));
   if (!session) return null;
   const epoch = await currentEpoch();
-  if (session.epoch !== epoch) return null;
+  // Unknown epoch (Notion unreadable): accept the signed session rather than signing everyone out.
+  if (epoch !== null && session.epoch !== epoch) return null;
   return session;
 }
 
@@ -45,7 +46,7 @@ export async function userOrNull(): Promise<CurrentUser | null> {
 export async function startSession(): Promise<void> {
   const cfg = authConfig();
   if (!cfg.ok) throw new Error(cfg.problem);
-  const epoch = await currentEpoch();
+  const epoch = (await currentEpoch()) ?? 0;
   const jar = await cookies();
   jar.set(sessionCookieName(), signSession(cfg.key, newSessionPayload(Math.floor(Date.now() / 1000), epoch)), sessionCookieOptions());
 }

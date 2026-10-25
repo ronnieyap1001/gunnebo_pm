@@ -91,7 +91,7 @@ export function useJob() {
         }
         // Finished, or failed for a reason a reload would not fix: stop resuming on reload. After a busy spell or an
         // expired session (signing in comes back to this URL) the reload carries on.
-        if (opts.resume && (result.ok || (result.code !== "BUSY" && result.code !== "SESSION"))) setJobParam(null);
+        if (opts.resume && (result.ok || (result.code !== "BUSY" && result.code !== "NETWORK" && result.code !== "SESSION"))) setJobParam(null);
         return result;
       } finally {
         busy.current = false;

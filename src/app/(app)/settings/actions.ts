@@ -4,8 +4,8 @@ import { updateTag } from "next/cache";
 import { z } from "zod";
 import { fail, ok, type ActionResult } from "@/lib/action-result";
 import { runAction, runQuery } from "@/server/actions/run";
-import { bumpEpoch } from "@/server/auth/epoch";
-import { endSession } from "@/server/auth/session";
+import { bumpEpoch, resetEpochCache } from "@/server/auth/epoch";
+import { endSession, startSession } from "@/server/auth/session";
 import { TAGS } from "@/server/queries";
 import { getRepo, getStorageAdmin } from "@/server/repo";
 import {
@@ -123,6 +123,10 @@ export async function startOverAction(confirmation: string): Promise<ActionResul
   return runQuery(async () => {
     await startOver(getStorageAdmin(), parsed.data);
     refreshAllTags();
+    // The settings (including the sign-out counter) were moved to the trash: re-issue this browser's session so it
+    // matches the fresh counter instead of signing the user out a minute later.
+    resetEpochCache();
+    await startSession();
     return null;
   });
 }

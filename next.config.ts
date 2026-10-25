@@ -29,7 +29,22 @@ const nextConfig: NextConfig = {
     },
   },
   async headers() {
-    return [{ source: "/:path*", headers: securityHeaders }];
+    return [
+      { source: "/:path*", headers: securityHeaders },
+      // File downloads: a later matching rule wins, so these override the global CSP and referrer policy.
+      // `sandbox` stops an uploaded HTML/SVG file from running script on the app's origin.
+      {
+        source: "/api/files/:id",
+        headers: [
+          { key: "Content-Security-Policy", value: "sandbox; frame-ancestors 'none'" },
+          { key: "Referrer-Policy", value: "no-referrer" },
+        ],
+      },
+      {
+        source: "/api/export/:path*",
+        headers: [{ key: "Referrer-Policy", value: "no-referrer" }],
+      },
+    ];
   },
 };
 

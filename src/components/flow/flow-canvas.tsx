@@ -233,6 +233,7 @@ function FlowCanvasInner({
   useEffect(() => () => {
     if (hoverTimer.current) clearTimeout(hoverTimer.current);
   }, []);
+  const [selectedEdges, setSelectedEdges] = useState<Set<string>>(() => new Set());
   const withDeleteButton = Boolean(edgeDeleteButton && editArrows && onDeleteEdges);
   const deleteEdge = useCallback((id: string) => onDeleteEdges?.([id]), [onDeleteEdges]);
 
@@ -248,6 +249,7 @@ function FlowCanvasInner({
           type: withDeleteButton ? "deletable" : "smoothstep",
           data: withDeleteButton ? { onDelete: deleteEdge, onHover: hoverEdge, hovered: hoveredEdge === e.id } : undefined,
           selectable: editArrows,
+          selected: editArrows && selectedEdges.has(e.id),
           deletable: editArrows,
           interactionWidth: 14,
           markerEnd: { type: MarkerType.ArrowClosed, width: 16, height: 16, color },
@@ -259,7 +261,7 @@ function FlowCanvasInner({
           },
         };
       }),
-    [inputEdges, editArrows, mode, withDeleteButton, deleteEdge, hoverEdge, hoveredEdge],
+    [inputEdges, editArrows, mode, withDeleteButton, deleteEdge, hoverEdge, hoveredEdge, selectedEdges],
   );
 
   const isValidConnection: IsValidConnection = useCallback(
@@ -368,9 +370,27 @@ function FlowCanvasInner({
       isValidConnection={isValidConnection}
       nodesConnectable={editArrows}
       onBeforeDelete={async ({ nodes: delNodes, edges: delEdges }) => {
+        if (delNodes.length) {
+          // React Flow also lists the node's arrows here. They must NOT be archived as "removed by you": archiving
+          // the node archives them itself and reconnects the neighbours (with Undo).
+          if (delNodes.length === 1 && onDeleteNode) onDeleteNode(delNodes[0].id);
+          return false;
+        }
         if (delEdges.length && editArrows) onDeleteEdges?.(delEdges.map((e) => e.id));
-        if (delNodes.length === 1 && onDeleteNode) onDeleteNode(delNodes[0].id);
         return false; // parent performs the archive (with Undo); React Flow never deletes directly
+      }}
+      onEdgesChange={(changes) => {
+        // Edges are rebuilt from props, so selection is kept here (needed for click + Delete on an arrow).
+        setSelectedEdges((prev) => {
+          let next = prev;
+          for (const c of changes) {
+            if (c.type !== "select") continue;
+            if (next === prev) next = new Set(prev);
+            if (c.selected) next.add(c.id);
+            else next.delete(c.id);
+          }
+          return next;
+        });
       }}
       deleteKeyCode={editArrows || onDeleteNode ? ["Backspace", "Delete"] : null}
       onlyRenderVisibleElements
@@ -405,6 +425,10 @@ export function FlowCanvas(props: FlowCanvasProps) {
 /** Imperative helpers for toolbars rendered inside the same FlowProvider. */
 export function useFlowControls() {
   const rf = useReactFlow();
+  return useMemo(() => flowControls(rf), [rf]);
+}
+
+function flowControls(rf: ReturnType<typeof useReactFlow>) {
   return {
     fitAll: () => rf.fitView({ padding: 0.1, duration: 300 }),
     fitIds: (ids: string[]) =>

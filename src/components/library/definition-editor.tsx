@@ -1,6 +1,6 @@
 "use client";
 
-import { useEffect, useMemo, useState } from "react";
+import { useEffect, useId, useMemo, useState } from "react";
 import {
   DndContext,
   KeyboardSensor,
@@ -329,6 +329,7 @@ function ChoicesEditor({
   const [copyOpen, setCopyOpen] = useState(false);
   const [copyQuery, setCopyQuery] = useState("");
   const copyList = others.filter((o) => o.name.toLowerCase().includes(copyQuery.trim().toLowerCase()));
+  const dndId = useId();
   const sensors = useSensors(useSensor(PointerSensor, { activationConstraint: { distance: 4 } }), useSensor(KeyboardSensor, { coordinateGetter: sortableKeyboardCoordinates }));
   const active = choices.filter((c) => !c.archived);
   const archived = choices.filter((c) => c.archived);
@@ -439,7 +440,7 @@ function ChoicesEditor({
         </div>
       </div>
 
-      <DndContext sensors={sensors} collisionDetection={closestCenter} onDragEnd={onDragEnd}>
+      <DndContext id={dndId} sensors={sensors} collisionDetection={closestCenter} onDragEnd={onDragEnd}>
         <SortableContext items={active.map((c) => c.id)} strategy={verticalListSortingStrategy}>
           <ul className="space-y-1">
             {active.map((c) => (

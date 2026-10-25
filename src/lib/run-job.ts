@@ -42,12 +42,13 @@ export async function runJob(
       if (isStaleDeploymentError(err)) {
         return { ok: false, error: "The app was updated while this was running. Reload the page to continue.", code: "STALE_DEPLOYMENT" };
       }
-      result = { ok: false, error: "Network problem.", code: "BUSY" };
+      result = { ok: false, error: "Can't reach the server. Check your connection and try again.", code: "NETWORK" };
     }
     if (!result.ok) {
-      if (result.code === "BUSY" && busy < maxBusy) {
+      if ((result.code === "BUSY" || result.code === "NETWORK") && busy < maxBusy) {
         busy++;
-        opts.onProgress?.({ ...last, message: `Notion is busy, retrying (${busy} of ${maxBusy})…` });
+        const why = result.code === "NETWORK" ? "Can't reach the server" : "Notion is busy";
+        opts.onProgress?.({ ...last, message: `${why}, retrying (${busy} of ${maxBusy})…` });
         await sleep(Math.min(30_000, 1000 * 2 ** busy));
         continue;
       }

@@ -32,6 +32,16 @@ describe("project fields", () => {
     expect(await historyOfType(w, EV.projectFieldCreated)).toHaveLength(1);
   });
 
+  it("refuses a second active field with the same name (any case), on create and on rename", async () => {
+    await expectAppError(createProjectField(w.ctx(), { label: "customer", fieldType: "TEXT" }), "VALIDATION", /already a project field called "Customer"/);
+    const extra = await createProjectField(w.ctx(), { label: "Gate count", fieldType: "NUMBER" });
+    await expectAppError(updateProjectField(w.ctx(), extra.id, { label: "Product" }), "VALIDATION", /already a project field/);
+    // Renaming a field to its own name in another case is fine; an archived field's name may be reused.
+    await updateProjectField(w.ctx(), extra.id, { label: "Gate Count" });
+    await archiveProjectField(w.ctx(), extra.id);
+    await expect(createProjectField(w.ctx(), { label: "Gate count", fieldType: "NUMBER" })).resolves.toMatchObject({ label: "Gate count" });
+  });
+
   it("system fields can be renamed and get choices, but not be archived or lose their choices type", async () => {
     const customer = await field("customer");
     await updateProjectField(w.ctx(), customer.id, { label: "Client" });
