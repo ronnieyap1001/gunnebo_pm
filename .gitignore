@@ -27,3 +27,8 @@ coverage/
 
 # OS files
 .DS_Store
+
+# Vercel and misc
+.vercel
+*.pem
+npm-debug.log*
