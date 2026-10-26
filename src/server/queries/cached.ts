@@ -15,7 +15,7 @@ import { after } from "next/server";
 import { todayIn } from "@/domain/dates";
 import type { DayContext, EventSource, ProjectField, Template } from "@/domain/types";
 import { fakeNotionFile, getNotion, storageMode } from "@/server/notion/client";
-import { discoverShareableRegistry, parentTitleFor } from "@/server/notion/registry";
+import { discoverRegistry, parentTitleFor } from "@/server/notion/registry";
 import { SCHEMA_VERSION } from "@/server/notion/schema";
 import { getRepo, getStorageAdmin, setRegistryLoader } from "@/server/repo";
 import { getAppSettings, type AppSettings } from "@/server/services/admin";
@@ -35,9 +35,10 @@ import { CACHE_REVALIDATE_SECONDS, SCHEMA_REVALIDATE_SECONDS, TAGS } from "./tag
 /**
  * One schema discovery for all server instances: a cold instance reads the registry from Next's data cache instead
  * of making ~20 Notion requests, and "Check again", "Reload from Notion", Setup and "Start over" (which revalidate the
- * 'schema' tag) reach every instance. Only a ready registry is cached (discoverShareableRegistry throws any other one
- * back to the instance that asked); when the data cache is unavailable the repo discovers directly. The key names the
- * environment, the parent page setting and the token (hashed), and with local test data the data file, so another
+ * 'schema' tag) reach every instance. Every registry is cached, ready or not, so that the hourly refresh can replace a
+ * ready copy that went out of date (a database moved to Notion's trash): the repo only trusts a ready copy, and checks
+ * any other one with a direct discovery. When the data cache is unavailable the repo discovers directly. The key names
+ * the environment, the parent page setting and the token (hashed), and with local test data the data file, so another
  * workspace, page or test file never reuses an entry.
  */
 function shareSchemaRegistry(): void {
@@ -46,17 +47,37 @@ function shareSchemaRegistry(): void {
   const tokenHash = env.NOTION_TOKEN ? createHash("sha256").update(env.NOTION_TOKEN).digest("hex").slice(0, 16) : "none";
   const fakeFile = mode === "fake" ? (fakeNotionFile(env) ?? ":memory:") : "";
   const loader = unstable_cache(
-    async () => discoverShareableRegistry(getNotion()),
+    async () => discoverRegistry(getNotion()),
     ["gpm", TAGS.schema, String(SCHEMA_VERSION), mode, parentTitleFor(env), env.NOTION_PARENT_PAGE_ID ?? "", tokenHash, fakeFile],
     { tags: [TAGS.schema], revalidate: SCHEMA_REVALIDATE_SECONDS },
   );
-  setRegistryLoader(loader, () => {
-    try {
-      revalidateTag(TAGS.schema, { expire: 0 });
-    } catch {
-      // Not allowed while rendering: this instance rediscovers directly; the shared entry expires on its own.
-    }
-  });
+  setRegistryLoader(loader, dropSharedRegistry);
+}
+
+/**
+ * Drops the shared schema registry (the repo met a stale id, Setup ran, or a direct discovery disagreed with it), so
+ * every instance discovers again. revalidateTag is not allowed while a page renders: the drop then runs right after
+ * the response (after() callbacks may revalidate). Inside a cached function neither works; the instance that saw the
+ * stale id then ignores the old copy on its own (createRegistryHandle) until the hourly refresh replaces it.
+ */
+function dropSharedRegistry(): void {
+  try {
+    revalidateTag(TAGS.schema, { expire: 0 });
+    return;
+  } catch {
+    // Rendering a page, or inside a cached function: try after the response.
+  }
+  try {
+    after(() => {
+      try {
+        revalidateTag(TAGS.schema, { expire: 0 });
+      } catch {
+        // Called inside a cached function: see above.
+      }
+    });
+  } catch {
+    // Outside a request (a script or a test): nothing is shared.
+  }
 }
 shareSchemaRegistry();
 

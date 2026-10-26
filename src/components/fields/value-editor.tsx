@@ -1,6 +1,6 @@
 "use client";
 
-import { useEffect, useMemo, useRef, useState } from "react";
+import { useEffect, useId, useMemo, useRef, useState } from "react";
 import { CalendarDays, ExternalLink, X } from "lucide-react";
 import type {
   CheckboxValue,
@@ -29,6 +29,7 @@ import { Calendar } from "@/components/ui/calendar";
 import { Popover, PopoverContent, PopoverTrigger } from "@/components/ui/popover";
 import { StateDot } from "@/components/state/state-badge";
 import { STATE_META } from "@/domain/state";
+import { hintedBy, InputHint, PERCENT_HINT } from "./input-hint";
 
 export interface ValueEditorProps {
   def: FieldDef;
@@ -364,6 +365,7 @@ function PercentEditor({ value, onCommit, disabled, autoFocus, label }: ValueEdi
   const [local, setLocal] = useState(committed);
   const [text, setText] = useState(String(committed));
   const [invalid, setInvalid] = useState(false);
+  const hintId = useId();
   useEffect(() => {
     setLocal(committed);
     setText(String(committed));
@@ -378,7 +380,7 @@ function PercentEditor({ value, onCommit, disabled, autoFocus, label }: ValueEdi
     if (value === null && clamped === 0) return;
     if (clamped !== committed || value === null) onCommit({ percent: clamped });
   };
-  // Typed text: "12.5" saves 13, "150" or "abc" saves nothing and shows a hint.
+  // Typed text: "12.5" saves 13, "150" or "abc" saves nothing and shows a hint (announced to screen readers).
   const commitText = () => {
     const n = parsePercentInput(text);
     if (n === null) {
@@ -419,12 +421,12 @@ function PercentEditor({ value, onCommit, disabled, autoFocus, label }: ValueEdi
             disabled={disabled}
             autoFocus={autoFocus}
             aria-label={label ? `${label}: percent` : "Percent"}
-            aria-invalid={invalid || undefined}
+            {...hintedBy(hintId, invalid)}
           />
           <span className="text-sm text-muted-foreground">%</span>
         </div>
       </div>
-      {invalid ? <p className="text-xs text-destructive">Enter a number from 0 to 100.</p> : null}
+      {invalid ? <InputHint id={hintId}>{PERCENT_HINT}</InputHint> : null}
       <div className="flex gap-1">
         {[0, 25, 50, 75, 100].map((n) => (
           <Button key={n} variant={local === n ? "secondary" : "outline"} size="sm" className="h-7 flex-1" disabled={disabled} onClick={() => commit(n)}>

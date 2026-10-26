@@ -8,7 +8,7 @@
  */
 import { z } from "zod";
 import { FIELD_TYPES, NODE_FLAGS, PROJECT_STATUSES, STATES, type Flow, type FlowEdge } from "@/domain/types";
-import type { ActionResult } from "@/lib/action-result";
+import { fail, type ActionResult } from "@/lib/action-result";
 import { runAction, runQuery } from "@/server/actions/run";
 import {
   getProjectHistory,
@@ -55,7 +55,7 @@ import {
   type StepWriteResult,
   type SyncPreview,
 } from "@/server/services";
-import type { JobStepResult } from "@/server/services/jobs";
+import { isDriverId, progressOf, type JobStepResult } from "@/server/services/jobs";
 import type { PageSnapshot, StepResult, StepWriteData } from "@/components/project/types";
 
 // ---------------------------------------------------------------------------
@@ -430,17 +430,17 @@ export async function startSyncAction(opId: string, input: { projectId: string; 
   });
 }
 
-export async function continueSyncAction(opId: string): Promise<ActionResult<JobStepResult & { appliedItemIds?: string[] }>> {
+/** Next batch of a sync. `driver`: the browser run (runJob); RUNNING_ELSEWHERE while another tab or window runs it. */
+export async function continueSyncAction(opId: string, driver?: string): Promise<ActionResult<JobStepResult & { appliedItemIds?: string[] }>> {
+  if (!isDriverId(driver)) return fail("This task's window id is not valid. Reload the page and try again.", "VALIDATION");
   return runAction(opId, async (ctx) => {
-    const r = await continueSync(ctx, parse(OpId, opId));
-    return { done: r.done, message: r.message, fraction: r.fraction, total: r.total, doneCount: r.doneCount, appliedItemIds: r.appliedItemIds };
+    const r = await continueSync(ctx, parse(OpId, opId), { driver: driver ?? undefined });
+    return { ...progressOf(r), appliedItemIds: r.appliedItemIds };
   });
 }
 
-/** Finishes copying the template into a project whose setup was interrupted. */
-export async function continueCreateAction(opId: string): Promise<ActionResult<JobStepResult>> {
-  return runAction(opId, async (ctx) => {
-    const r = await continueCreateProject(ctx, parse(OpId, opId));
-    return { done: r.done, message: r.message, fraction: r.fraction, total: r.total, doneCount: r.doneCount };
-  });
+/** Finishes copying the template into a project whose setup was interrupted (or waits while another tab copies it). */
+export async function continueCreateAction(opId: string, driver?: string): Promise<ActionResult<JobStepResult>> {
+  if (!isDriverId(driver)) return fail("This task's window id is not valid. Reload the page and try again.", "VALIDATION");
+  return runAction(opId, async (ctx) => progressOf(await continueCreateProject(ctx, parse(OpId, opId), { driver: driver ?? undefined })));
 }

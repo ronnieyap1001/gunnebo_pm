@@ -31,13 +31,13 @@ export async function restoreMilestoneAction(opId: string, milestoneId: string):
   return runAction(opId, (ctx) => restoreMilestone(ctx, milestoneId), { tags: [TAGS.library] });
 }
 
-export async function restoreProjectFieldAction(opId: string, fieldId: string): Promise<ActionResult<null>> {
+export async function restoreProjectFieldAction(opId: string, fieldId: string): Promise<ActionResult<{ mirrorsNote?: string }>> {
   if (!id.safeParse(fieldId).success) return bad();
   return runAction(
     opId,
     async (ctx) => {
-      await restoreProjectField(ctx, fieldId);
-      return null;
+      const r = await restoreProjectField(ctx, fieldId);
+      return r.mirrorsNote ? { mirrorsNote: r.mirrorsNote } : {};
     },
     { tags: [TAGS.projectFields] },
   );

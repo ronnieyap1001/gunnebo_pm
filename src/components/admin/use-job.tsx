@@ -3,7 +3,7 @@
 import { useCallback, useRef, useState } from "react";
 import { ProgressDialog } from "@/components/common/progress-dialog";
 import type { ActionResult } from "@/lib/action-result";
-import { runJob, type JobProgress } from "@/lib/run-job";
+import { runJob, RUNNING_ELSEWHERE_MESSAGE, type JobProgress } from "@/lib/run-job";
 import { classifyThrown } from "./call";
 
 interface JobView {
@@ -40,15 +40,20 @@ function setJobParam(resume: { jobId: string; kind: string } | null) {
 
 /**
  * Runs a resumable server job with the shared ProgressDialog. Each `step` is idempotent on the server; BUSY answers
- * are retried with backoff by runJob. When the deployment changed under the open tab, the page reloads and the job
- * resumes from `?job=`.
+ * are retried with backoff by runJob, which passes `step` its run's driver id (give it to the continue action, so the
+ * dialog waits while another tab or window runs the same job). When the deployment changed under the open tab, the
+ * page reloads and the job resumes from `?job=`.
  */
 export function useJob() {
   const [view, setView] = useState<JobView>({ open: false, title: "", message: "" });
   const busy = useRef(false);
 
   const run = useCallback(
-    async (title: string, step: () => Promise<ActionResult<JobProgress>>, opts: RunOptions = {}): Promise<ActionResult<JobProgress>> => {
+    async (
+      title: string,
+      step: (driver: string) => Promise<ActionResult<JobProgress>>,
+      opts: RunOptions = {},
+    ): Promise<ActionResult<JobProgress>> => {
       if (busy.current) return { ok: false, error: "Another task is still running. Wait for it to finish.", code: "BUSY_LOCAL" };
       busy.current = true;
       setView({ open: true, title, message: "Starting…", fraction: 0 });
@@ -57,9 +62,9 @@ export function useJob() {
       // Classify thrown errors here (runJob would report an expired session as "the app was updated"): network
       // trouble becomes BUSY so runJob retries it with backoff; an expired session stops the job.
       let offline = false;
-      const guarded = async (): Promise<ActionResult<JobProgress>> => {
+      const guarded = async (driver: string): Promise<ActionResult<JobProgress>> => {
         try {
-          const r = await step();
+          const r = await step(driver);
           offline = false;
           return r;
         } catch (err) {
@@ -76,6 +81,10 @@ export function useJob() {
             if (!p.done && /^Notion is busy, retrying/.test(p.message)) {
               const message = offline ? p.message.replace("Notion is busy", "Can't reach the server") : p.message;
               setView((v) => ({ ...v, message }));
+              return;
+            }
+            if (p.message === RUNNING_ELSEWHERE_MESSAGE) {
+              setView((v) => ({ ...v, message: p.message, fraction: p.fraction ?? v.fraction }));
               return;
             }
             const shown = opts.map ? opts.map(p, previous) : p;

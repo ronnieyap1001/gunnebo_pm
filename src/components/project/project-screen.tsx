@@ -394,13 +394,18 @@ function ProjectScreenInner({ data, readAt, timeZone, displayName, initialView, 
   );
 }
 
-/** A project whose copy from the template was interrupted: finish it (resumable job) or archive it. */
+/**
+ * A project whose copy from the template has not finished: finish it here (resumable job; while another tab or window
+ * is still copying, the dialog waits for it) or, when the copy can't be resumed, archive it.
+ */
 function SetupPending({ setupJob, onDone, onArchive }: { setupJob: string | null; onDone: () => void; onArchive: () => void }) {
   const [running, setRunning] = useState<{ message: string; fraction?: number } | null>(null);
   async function resume() {
     if (!setupJob) return;
     setRunning({ message: "Continuing…", fraction: 0 });
-    const r = await runJob(() => attempt(() => continueCreateAction(setupJob)), { onProgress: (p) => setRunning({ message: p.message, fraction: p.fraction }) });
+    const r = await runJob((driver) => attempt(() => continueCreateAction(setupJob, driver)), {
+      onProgress: (p) => setRunning({ message: p.message, fraction: p.fraction }),
+    });
     setRunning(null);
     if (r.ok) {
       toast.success("The project is ready");
@@ -425,7 +430,7 @@ function SetupPending({ setupJob, onDone, onArchive }: { setupJob: string | null
         }
       >
         {setupJob
-          ? "Copying the milestones from the template was interrupted. Finish it now; nothing is copied twice."
+          ? "Copying the milestones from the template has not finished. If another tab or window is still copying them, this waits for it; otherwise it carries on where the copy stopped. Nothing is copied twice."
           : "Copying the milestones from the template was interrupted and can't be resumed. Archive this project and create it again."}
       </EmptyState>
       <ProgressDialog open={Boolean(running)} title="Setting up the project" message={running?.message ?? ""} fraction={running?.fraction} />

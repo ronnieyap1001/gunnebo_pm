@@ -389,9 +389,10 @@ export function ArchiveScreen({
                           restore({
                             ids: [f.id],
                             call: (opId) => restoreProjectFieldAction(opId, f.id),
-                            success: () => ({
+                            success: (r) => ({
                               title: `“${f.label}” restored`,
-                              description: "Projects show the field again, with the values they had.",
+                              // Too many projects to refresh their Notion copies now: say how to do it.
+                              description: r?.mirrorsNote ?? "Projects show the field again, with the values they had.",
                               action: { label: "Open Library", href: "/library?tab=project-fields" },
                             }),
                           })

@@ -14,7 +14,7 @@ import { runAction, runQuery } from "@/server/actions/run";
 import { TAGS } from "@/server/queries/tags";
 import { getRepo } from "@/server/repo";
 import { AppError } from "@/server/services/context";
-import type { JobStepResult } from "@/server/services/jobs";
+import { isDriverId, progressOf, type JobStepResult } from "@/server/services/jobs";
 import {
   addTemplateEdge,
   applyChoicesTo,
@@ -220,10 +220,11 @@ export async function startImportAction(opId: string, text: unknown): Promise<Ac
  * Next batch of the import job. The cached library and project fields are refreshed only when the job is done, so
  * the page never re-renders a half-imported template.
  */
-export async function continueImportAction(opId: string): Promise<ActionResult<JobStepResult>> {
+export async function continueImportAction(opId: string, driver?: string): Promise<ActionResult<JobStepResult>> {
   if (!JobId.safeParse(opId).success) return fail("This task is missing its id. Reload the page and try again.", "VALIDATION");
+  if (!isDriverId(driver)) return fail("This task's window id is not valid. Reload the page and try again.", "VALIDATION");
   return runAction(opId, async (ctx) => {
-    const r = await continueImport(ctx, opId);
+    const r = await continueImport(ctx, opId, { driver: driver ?? undefined });
     if (r.done) {
       updateTag(TAGS.library);
       updateTag(TAGS.projectFields);
@@ -248,10 +249,11 @@ export async function startSyncDefaultsAction(
   return runAction(opId, (ctx) => startSyncDefaults(ctx, parse(Id, projectId)));
 }
 
-export async function continueSyncAction(opId: string): Promise<ActionResult<JobStepResult & { projectId: string }>> {
+export async function continueSyncAction(opId: string, driver?: string): Promise<ActionResult<JobStepResult & { projectId: string }>> {
   if (!JobId.safeParse(opId).success) return fail("This task is missing its id. Reload the page and try again.", "VALIDATION");
+  if (!isDriverId(driver)) return fail("This task's window id is not valid. Reload the page and try again.", "VALIDATION");
   return runAction(opId, async (ctx) => {
-    const r = await continueSync(ctx, opId);
-    return { done: r.done, message: r.message, fraction: r.fraction, total: r.total, doneCount: r.doneCount, projectId: r.projectId };
+    const r = await continueSync(ctx, opId, { driver: driver ?? undefined });
+    return { ...progressOf(r), projectId: r.projectId };
   });
 }

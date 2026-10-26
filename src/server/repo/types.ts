@@ -131,6 +131,8 @@ export interface Repo {
 
   projectFields: {
     list(opts?: ListOpts): Promise<ProjectField[]>;
+    /** One field by id (archived included); null when it is gone or in Notion's trash. */
+    get(id: string): Promise<ProjectField | null>;
     create(input: ProjectFieldInput): Promise<ProjectField>;
     update(id: string, patch: Partial<ProjectFieldInput>): Promise<ProjectField>;
     /** Removes a second copy a retried batch created (see `steps.discard`). */

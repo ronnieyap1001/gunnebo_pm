@@ -8,24 +8,41 @@ import { importTempId, planTemplateImport, type ImportPlan } from "@/domain/impo
 import { seedTemplateFile } from "@/domain/seed";
 import { remapFlow } from "@/domain/snapshot";
 import { exportTemplateFile, parseTemplateFile, type TemplateFile } from "@/domain/templateFile";
-import type { Iso, Milestone, ProjectField } from "@/domain/types";
+import { stableStringify } from "@/domain/syncPlan";
+import type { Flow, Iso, Milestone, ProjectField } from "@/domain/types";
 import type { MilestoneInput, ProjectFieldInput, Repo } from "@/server/repo/types";
 import { appendHistory, AppError, EV, LIBRARY_PREFIX, newId, SETTINGS, summaryFor, type Ctx } from "./context";
 import {
+  assertJobFits,
   BATCH_SIZE,
+  beginJobCall,
+  claimJob,
+  elsewhereResult,
   finishJob,
   isFinished,
   JOB_LOOKUP,
+  JOB_PREFIX,
   jobPause,
+  laterOf,
   loadJob,
   loadJobForContinue,
+  mergeRecord,
   newJob,
+  orphansOf,
+  recheckJob,
+  SAMPLE_ID,
+  SAMPLE_LEASE,
+  sameRecord,
   saveJob,
+  saveRunningJob,
   stepResult,
   type JobBase,
   type JobStepResult,
+  type JobTombstone,
+  type SaveOutcome,
 } from "./jobs";
 import { getTemplate, readTemplateRevision, saveTemplateFlow } from "./library";
+import { settleAll } from "./projects";
 import { listProjectFields } from "./projectFields";
 
 export type ImportReason = "import" | "seed" | "reset";
@@ -176,19 +193,30 @@ export interface ImportJob extends JobBase<"import"> {
   createdMilestones?: Record<string, string>;
   createdFields?: Record<string, string>;
   /**
+   * When this job last created a row. A retry whose query did not show a row yet creates it again: finalizing waits
+   * until the query shows every recorded row, so a first copy (created earlier) shows too and goes to the trash.
+   */
+  lastCreateAt?: Iso;
+  /**
    * When a write of this job last failed with an answer that does not rule out that Notion saved it (a 5xx, a timeout,
-   * a crash). The retry may then have created a second copy of a row the query did not show yet, so finalizing waits
-   * until COPY_GRACE_MS have passed: by then the copy shows in the query and finalizing moves it to the trash.
+   * a crash): the time of the failure, not of the call's start (a create can fail 20 s into a call). The retry may then
+   * have created a second copy of a row the query did not show yet, so finalizing waits until COPY_GRACE_MS have
+   * passed: by then the copy shows in the query and finalizing moves it to the trash.
    */
   failedAt?: Iso;
   /** Calls that waited for that (see COPY_WAIT_LIMIT). */
   copyWaits?: number;
 }
 
-/** How long an import waits after a failed write before it finalizes (longer than Notion's query lag). */
+/** How long an import waits after a failed write (or its latest create) before it finalizes (longer than Notion's query lag). */
 export const COPY_GRACE_MS = 10_000;
-/** At most this many calls wait (each pauses JOB_LOOKUP.waitMs), so a server clock that lags never blocks the job. */
+/** At most this many calls wait, so a server clock that lags never blocks the job. */
 export const COPY_WAIT_LIMIT = 8;
+/**
+ * Another import that saved its job this recently (or holds a lease) counts as running: a new import, seed or reset is
+ * refused meanwhile. Older unfinished imports do not block (Setup offers to resume them).
+ */
+export const IMPORT_RUNNING_MS = 10 * 60_000;
 
 function planTotal(plan: StoredImportPlan): number {
   return (
@@ -201,9 +229,67 @@ function planTotal(plan: StoredImportPlan): number {
   );
 }
 
+/** What a finished import keeps of its record (see ImportTombstone). */
+interface ImportResult {
+  revision?: number;
+  did?: number;
+  reason?: ImportReason;
+  createdMilestones?: Record<string, string>;
+  createdFields?: Record<string, string>;
+}
+type ImportTombstone = JobTombstone<"import"> & { result?: ImportResult };
+
+/**
+ * Other import jobs, read again by page id (the list comes from a query that may be stale): the running ones, and
+ * those that finished at or after `finishedSince` (only those can have created rows for the keys this job creates).
+ */
+async function otherImports(ctx: Ctx, opId: string, finishedSince?: Iso): Promise<(ImportJob | ImportTombstone)[]> {
+  const all = await ctx.repo.settings.list(JOB_PREFIX);
+  const out: (ImportJob | ImportTombstone)[] = [];
+  for (const value of Object.values(all)) {
+    const j = value as Partial<ImportTombstone> | null;
+    if (!j || typeof j !== "object" || j.kind !== "import" || !j.opId || j.opId === opId) continue;
+    if (j.status === "done" && (!finishedSince || !j.finishedAt || j.finishedAt < finishedSince)) continue;
+    const fresh = await loadJob<ImportJob | ImportTombstone>(ctx.repo, j.opId);
+    if (!fresh || fresh.kind !== "import") continue;
+    if (isFinished(fresh) && (!finishedSince || fresh.finishedAt < finishedSince)) continue;
+    out.push(fresh);
+  }
+  return out;
+}
+
+/** Key → id records of another import (from its job, or what its tombstone kept). */
+function recordsOf(j: ImportJob | ImportTombstone): { milestones: Record<string, string>; fields: Record<string, string> } {
+  const r = isFinished(j) ? (j as ImportTombstone).result : (j as ImportJob);
+  return { milestones: r?.createdMilestones ?? {}, fields: r?.createdFields ?? {} };
+}
+
+/** Other imports still running that saved their job recently or hold a lease (a new import waits for them). */
+async function runningImports(ctx: Ctx): Promise<ImportJob[]> {
+  const now = Date.parse(ctx.now);
+  return (await otherImports(ctx, ctx.opId)).filter(
+    (j): j is ImportJob =>
+      !isFinished(j) && (now - Date.parse(j.updatedAt) < IMPORT_RUNNING_MS || (!!j.lease && Date.parse(j.lease.until) > now)),
+  );
+}
+
+/** True when a seed job finished before (its tombstone says so). */
+async function seedJobFinished(ctx: Ctx): Promise<boolean> {
+  const all = await ctx.repo.settings.list(JOB_PREFIX);
+  return Object.values(all).some((v) => {
+    const j = v as Partial<JobTombstone<"import">> | null;
+    return !!j && typeof j === "object" && j.kind === "import" && j.status === "done" && j.result?.reason === "seed";
+  });
+}
+
 /**
  * Starts an import job ("replace the template"): validates, plans, and first saves the current template as a
  * History row `template.snapshot` (unless the library is empty). Call continueImport until done.
+ *
+ * Refused while another import, seed or reset is running (two would create the same milestones), and a seed is
+ * refused once the template has milestones, the seed marker exists or a seed job finished (each read again, so a
+ * second tab or server instance that still shows "Load the 64 milestones" cannot load them twice). A file whose job
+ * could outgrow what Notion stores is refused before anything is written.
  */
 export async function startImport(
   ctx: Ctx,
@@ -214,24 +300,26 @@ export async function startImport(
   if (existing?.kind === "import") return { total: existing.total, summary: existing.plan.summary };
 
   const reason = opts.reason;
-  if (reason === "seed" && (await ctx.repo.settings.get(SETTINGS.seedAppliedAt))) {
-    throw new AppError("VALIDATION", "The 64 milestones are already loaded. Use “Reset template to seed” in Settings instead.");
-  }
   const file = parseTemplateOrThrow(json);
   const [template, fields] = await Promise.all([getTemplate(ctx.repo), listProjectFields(ctx.repo, { includeArchived: true })]);
-  if (template.milestones.length > 0) {
-    const snapshot = exportTemplateFile(template, fields, ctx.now);
-    await appendHistory(
-      ctx,
-      {
-        type: EV.templateSnapshot,
-        source: "SYSTEM",
-        summary: summaryFor(LIBRARY_PREFIX, `Template saved before ${reason === "reset" ? "the reset" : "the import"}`),
-        data: { reason, revision: template.revision, file: snapshot },
-      },
-      { opId: `${ctx.opId}:snapshot` },
+  if (reason === "seed") {
+    const seeded =
+      template.milestones.length > 0 ||
+      (await ctx.repo.settings.get(SETTINGS.seedAppliedAt, { fresh: true })) !== undefined ||
+      (await seedJobFinished(ctx));
+    if (seeded) throw new AppError("VALIDATION", "The 64 milestones are already loaded. Use “Reset template to seed” in Settings instead.");
+  }
+  const running = await runningImports(ctx);
+  if (running.length) {
+    throw new AppError(
+      "CONFLICT",
+      reason === "seed" && running.some((j) => j.reason === "seed")
+        ? "The 64 milestones are already being loaded, in another tab or window. Wait for it to finish, or continue it in Setup."
+        : "Another template import is still running, in another tab or window. Wait for it to finish, or continue it in Setup (Unfinished tasks).",
+      { opId: running[0].opId },
     );
   }
+
   const plan = await planFor(ctx, file, reason);
   const stored: StoredImportPlan = {
     ...plan,
@@ -245,7 +333,33 @@ export async function startImport(
     targetRevision: template.revision + 1,
     cursor: { updates: 0, archives: 0, fieldUpdates: 0 },
   };
-  await saveJob(ctx.repo, job);
+  // The job grows as it records what it creates: refuse up front a file whose job could not be saved to the end.
+  assertJobFits(
+    {
+      ...job,
+      createdMilestones: Object.fromEntries(stored.milestoneCreates.map((c) => [c.data.key, SAMPLE_ID])),
+      createdFields: Object.fromEntries(stored.projectFieldCreates.map((f) => [f.key, SAMPLE_ID])),
+      lastCreateAt: ctx.now,
+      failedAt: ctx.now,
+      copyWaits: COPY_WAIT_LIMIT,
+      lease: SAMPLE_LEASE,
+    } as ImportJob,
+    "This template file",
+  );
+  if (template.milestones.length > 0) {
+    const snapshot = exportTemplateFile(template, fields, ctx.now);
+    await appendHistory(
+      ctx,
+      {
+        type: EV.templateSnapshot,
+        source: "SYSTEM",
+        summary: summaryFor(LIBRARY_PREFIX, `Template saved before ${reason === "reset" ? "the reset" : "the import"}`),
+        data: { reason, revision: template.revision, file: snapshot },
+      },
+      { opId: `${ctx.opId}:snapshot` },
+    );
+  }
+  await saveJob(ctx.repo, job, { creates: true });
   return { total: job.total, summary: plan.summary };
 }
 
@@ -262,28 +376,69 @@ export function startResetTemplate(ctx: Ctx): Promise<{ total: number; summary: 
 /**
  * Applies up to 8 items per call: milestone creates (recorded in the job by key; a key Notion already shows counts as
  * done), updates, archives (never deletes), project-field creates (recorded by key) and updates. The job is saved
- * after every batch, also when a write fails part-way, and before finalizing. After a failed write, finalizing waits
- * until COPY_GRACE_MS have passed (see ImportJob.failedAt). Then saves the remapped flow, revision + 1, moves any second
- * copy a crashed batch may have caused to Notion's trash, sets Settings 'seed.appliedAt' when seeding or resetting, and
- * writes History `template.imported` (or `template.seeded`) last.
+ * after every batch, also when a write fails part-way, and before finalizing; what another call recorded meanwhile is
+ * kept (see saveRunningJob). Before finalizing, every recorded row is read again (one deleted meanwhile is created
+ * again), and the job waits until the query shows them all, or until COPY_GRACE_MS after a failed write (see
+ * ImportJob.failedAt). Then saves the remapped flow, revision + 1, moves any second copy a crashed batch may have
+ * caused to Notion's trash, sets Settings 'seed.appliedAt' when seeding or resetting, and writes History
+ * `template.imported` (or `template.seeded`) last.
+ *
+ * `driver` identifies the browser run (see claimJob): while another run holds the job, the call only reports
+ * RUNNING_ELSEWHERE. Finalizing works from the record Notion has, uses a row the template flow already has for a
+ * planned milestone (another call or import finalized first), and discards only copies nothing refers to.
  */
-export async function continueImport(ctx: Ctx, opId: string): Promise<JobStepResult> {
-  const job = await loadJobForContinue<ImportJob>(ctx.repo, opId);
-  if (!job || job.kind !== "import") throw new AppError("NOT_FOUND", "This import was not found. Start it again.");
-  if (isFinished(job)) return stepResult(true, job.total, job.total, "Template updated");
+export async function continueImport(ctx: Ctx, opId: string, opts: { driver?: string } = {}): Promise<JobStepResult> {
+  const call = beginJobCall(ctx, opts.driver);
+  const loaded = await loadJobForContinue<ImportJob>(ctx.repo, opId);
+  if (!loaded || loaded.kind !== "import") throw new AppError("NOT_FOUND", "This import was not found. Start it again.");
+  const claim = await claimJob(call, loaded);
+  if (claim.wait) return claim.wait;
+  const job = claim.job;
+  const doneResult = () => stepResult(true, job.total, job.total, "Template updated");
+  if (isFinished(job)) return doneResult();
   const { plan } = job;
   let budget = BATCH_SIZE;
   let did = 0;
   const createdMilestones: Record<string, string> = { ...(job.createdMilestones ?? {}) };
   const createdFields: Record<string, string> = { ...(job.createdFields ?? {}) };
-  const recordedAtStart = Object.keys(createdMilestones).length + Object.keys(createdFields).length;
-  const save = async (doneCount: number) => {
+  const recordedAtStart = { milestones: { ...createdMilestones }, fields: { ...createdFields } };
+  // Rows this call created (a copy nothing uses goes to the trash at once, see orphansOf) and recorded rows found deleted.
+  const made = { milestones: new Set<string>(), fields: new Set<string>() };
+  const gone = { milestones: new Set<string>(), fields: new Set<string>() };
+  const save = async (doneCount: number): Promise<SaveOutcome> => {
+    const lost: string[] = [];
     job.createdMilestones = createdMilestones;
     job.createdFields = createdFields;
     job.doneCount = doneCount;
     job.updatedAt = ctx.now;
-    await saveJob(ctx.repo, job);
+    const { outcome, stored } = await saveRunningJob(call, job, (st) => {
+      lost.push(...mergeRecord(createdMilestones, st.createdMilestones, gone.milestones));
+      lost.push(...mergeRecord(createdFields, st.createdFields, gone.fields));
+      job.cursor = {
+        updates: Math.max(job.cursor.updates, st.cursor?.updates ?? 0),
+        archives: Math.max(job.cursor.archives, st.cursor?.archives ?? 0),
+        fieldUpdates: Math.max(job.cursor.fieldUpdates, st.cursor?.fieldUpdates ?? 0),
+      };
+      job.lastCreateAt = laterOf(job.lastCreateAt, st.lastCreateAt);
+      job.failedAt = laterOf(job.failedAt, st.failedAt);
+      job.copyWaits = Math.max(job.copyWaits ?? 0, st.copyWaits ?? 0) || undefined;
+    });
+    if (outcome === "elsewhere" && stored) job.lease = stored.lease;
+    const mine = (ids: Set<string>) => orphansOf(outcome, lost, ids);
+    const orphans = { milestones: mine(made.milestones), fields: mine(made.fields) };
+    if (orphans.milestones.length || orphans.fields.length) {
+      // What Notion records now: this job, or the record another call saved or finished it with.
+      const rec =
+        outcome === "saved" ? recordsOf(job) : stored ? recordsOf(stored as ImportJob | ImportTombstone) : { milestones: {}, fields: {} };
+      const protect = new Set([...Object.values(rec.milestones), ...Object.values(rec.fields)]);
+      await discardImportCopies(ctx, job, orphans.milestones, orphans.fields, protect);
+    }
+    made.milestones.clear();
+    made.fields.clear();
+    return outcome;
   };
+  const stopped = (outcome: SaveOutcome): JobStepResult =>
+    outcome === "finished" ? doneResult() : elsewhereResult(job, job.lease!, call.now());
 
   // Recorded creates first; the query adds the milestones that existed before (and anything a crashed batch created).
   const milestones = await ctx.repo.milestones.list({ includeArchived: true });
@@ -305,6 +460,8 @@ export async function continueImport(ctx: Ctx, opId: string): Promise<JobStepRes
       const m = await ctx.repo.milestones.create(c.data as MilestoneInput);
       createdMilestones[c.data.key] = m.id;
       idByKey.set(c.data.key, m.id);
+      made.milestones.add(m.id);
+      job.lastCreateAt = call.now();
       budget--;
       did++;
     }
@@ -345,6 +502,8 @@ export async function continueImport(ctx: Ctx, opId: string): Promise<JobStepRes
         if (budget <= 0) break;
         const created = await ctx.repo.projectFields.create(f as ProjectFieldInput);
         createdFields[f.key] = created.id;
+        made.fields.add(created.id);
+        job.lastCreateAt = call.now();
         budget--;
         did++;
       }
@@ -359,8 +518,9 @@ export async function continueImport(ctx: Ctx, opId: string): Promise<JobStepRes
     }
   } catch (e) {
     // Keep what was written before the failure, so the retry neither repeats it nor creates it a second time. Only
-    // "busy" (429) is sure to have written nothing; after anything else the write may have landed.
-    if ((e as { code?: unknown } | null)?.code !== "busy") job.failedAt = ctx.now;
+    // "busy" (429) is sure to have written nothing; after anything else the write may have landed (dated now: a write
+    // can fail late in a call, e.g. after the 20 s timeout).
+    if ((e as { code?: unknown } | null)?.code !== "busy") job.failedAt = call.now();
     await save(Math.min(job.total - 1, createdNow() + job.cursor.updates + job.cursor.archives + fieldKeys() + job.cursor.fieldUpdates)).catch(
       () => undefined,
     );
@@ -376,31 +536,147 @@ export async function continueImport(ctx: Ctx, opId: string): Promise<JobStepRes
     fieldsDone >= plan.projectFieldCreates.length &&
     job.cursor.fieldUpdates >= plan.projectFieldUpdates.length;
   const progress = Math.min(job.total - 1, createsDone + job.cursor.updates + job.cursor.archives + fieldsDone + job.cursor.fieldUpdates);
+  const notYet = (message = `Updating the template (${progress} of ${job.total})`, retryInMs?: number): JobStepResult => ({
+    ...stepResult(false, progress, job.total, message),
+    ...(retryInMs ? { retryInMs } : {}),
+  });
 
   if (!finished) {
-    await save(progress);
-    return stepResult(false, progress, job.total, `Updating the template (${progress} of ${job.total})`);
+    const outcome = await save(progress);
+    return outcome === "saved" ? notYet() : stopped(outcome);
   }
-  if (did > 0 || Object.keys(createdMilestones).length + Object.keys(createdFields).length !== recordedAtStart) {
+  const changedRecord =
+    !sameRecord(createdMilestones, recordedAtStart.milestones) || !sameRecord(createdFields, recordedAtStart.fields);
+  if (did > 0 || changedRecord) {
     // Record what this call wrote before finalizing: if a finalize write fails, the retry must not create it again.
-    await save(progress);
-  }
-  if (job.failedAt && Date.parse(ctx.now) - Date.parse(job.failedAt) < COPY_GRACE_MS && (job.copyWaits ?? 0) < COPY_WAIT_LIMIT) {
-    // A failed write may have created a row the query does not show yet: wait until it does (see failedAt).
-    job.copyWaits = (job.copyWaits ?? 0) + 1;
-    await saveJob(ctx.repo, job);
-    await jobPause(JOB_LOOKUP.waitMs);
-    return stepResult(false, progress, job.total, "Checking Notion for duplicate rows");
+    const outcome = await save(progress);
+    if (outcome !== "saved") return stopped(outcome);
   }
 
-  // 5. Finalize: flow keyed by the recorded milestone ids, revision, History, second copies, seed marker.
+  // 5. Every recorded row must still exist (another call may have discarded it, or someone deleted it in Notion):
+  // forget one that is gone, so the next call finds the row the query shows for its key or creates it again.
+  const fieldsNow = await ctx.repo.projectFields.list({ includeArchived: true });
+  const listedM = new Set(milestones.map((m) => m.id));
+  const listedF = new Set(fieldsNow.map((f) => f.id));
+  const unseenM = Object.entries(createdMilestones).filter(([, id]) => !listedM.has(id));
+  const unseenF = Object.entries(createdFields).filter(([, id]) => !listedF.has(id));
+  const [readM, readF] = await Promise.all([
+    settleAll(unseenM.map(([, id]) => () => ctx.repo.milestones.get(id))),
+    settleAll(unseenF.map(([, id]) => () => ctx.repo.projectFields.get(id))),
+  ]);
+  unseenM.forEach(([key, id], i) => {
+    if (readM[i]) return;
+    delete createdMilestones[key];
+    gone.milestones.add(id);
+  });
+  unseenF.forEach(([key, id], i) => {
+    if (readF[i]) return;
+    delete createdFields[key];
+    gone.fields.add(id);
+  });
+  if (gone.milestones.size || gone.fields.size) {
+    const outcome = await save(Math.max(0, progress - gone.milestones.size - gone.fields.size));
+    return outcome === "saved" ? notYet() : stopped(outcome);
+  }
+
+  // 6. Finalize from the record Notion has (when another call saved a different one, the next call goes on from it).
+  const sameAsStored = (j: ImportJob) => sameRecord(j.createdMilestones, createdMilestones) && sameRecord(j.createdFields, createdFields);
+  const before = await recheckJob<ImportJob>(call, opId, sameAsStored);
+  if (before !== "same") return before === "finished" ? doneResult() : before === "changed" ? notYet() : before;
+  // A milestone the template flow already uses for a planned key wins over the recorded one: another call (or another
+  // import) finalized first, and both then keep the same rows.
+  const preFlow = await readFlowFresh(ctx.repo);
+  const byId = new Map(milestones.map((m) => [m.id, m]));
+  const flowUnseen = Object.keys(preFlow.nodes).filter((id) => !byId.has(id));
+  (await settleAll(flowUnseen.map((id) => () => ctx.repo.milestones.get(id)))).forEach((m) => {
+    if (m) byId.set(m.id, m);
+  });
+  let adopted = false;
+  const fromFlow = new Set<string>();
+  for (const c of plan.milestoneCreates) {
+    const key = c.data.key;
+    const inFlow = Object.keys(preFlow.nodes)
+      .map((id) => byId.get(id))
+      .find((m) => !!m && m.key === key && !m.archived && matchesPlannedMilestone(m, c.data as MilestoneInput));
+    if (!inFlow) continue;
+    fromFlow.add(key);
+    if (inFlow.id !== createdMilestones[key]) {
+      createdMilestones[key] = inFlow.id;
+      adopted = true;
+    }
+  }
+  // Likewise a row an older import (started before this one) recorded for a planned key, exactly as this plan creates
+  // it: two imports of the same file that overlapped then keep the same rows, even when this server instance does not
+  // see the other's template flow yet.
+  const older = (await otherImports(ctx, opId, job.createdAt))
+    .filter((o) => o.createdAt < job.createdAt || (o.createdAt === job.createdAt && o.opId < job.opId))
+    .sort((a, b) => (a.createdAt < b.createdAt ? -1 : a.createdAt > b.createdAt ? 1 : a.opId < b.opId ? -1 : 1));
+  if (older.length) {
+    const fieldById = new Map(fieldsNow.map((f) => [f.id, f]));
+    const fieldFrom = new Set<string>();
+    for (const o of older) {
+      const r = recordsOf(o);
+      for (const c of plan.milestoneCreates) {
+        const key = c.data.key;
+        const id = r.milestones[key];
+        if (!id || fromFlow.has(key) || id === createdMilestones[key]) continue;
+        const m = byId.get(id) ?? (await ctx.repo.milestones.get(id));
+        if (!m || !matchesPlannedMilestone(m, c.data as MilestoneInput)) continue;
+        byId.set(m.id, m);
+        createdMilestones[key] = m.id;
+        fromFlow.add(key);
+        adopted = true;
+      }
+      for (const f of plan.projectFieldCreates) {
+        const id = r.fields[f.key];
+        if (!id || fieldFrom.has(f.key) || id === createdFields[f.key]) continue;
+        const row = fieldById.get(id) ?? (await ctx.repo.projectFields.get(id));
+        if (!row || !matchesPlannedField(row, f as ProjectFieldInput)) continue;
+        fieldById.set(row.id, row);
+        createdFields[f.key] = row.id;
+        fieldFrom.add(f.key);
+        adopted = true;
+      }
+    }
+  }
+  if (adopted) {
+    // No merge here: Notion had exactly this call's record a moment ago, and the adopted rows must replace it.
+    job.createdMilestones = createdMilestones;
+    job.createdFields = createdFields;
+    const { outcome } = await saveRunningJob(call, job);
+    if (outcome !== "saved") return stopped(outcome);
+  }
+
+  // 7. The flow keyed by the recorded milestone ids, and revision + 1. Read back: when another import wrote its flow
+  // over it meanwhile, the next call adopts that one's milestones and writes again.
   const idMap: Record<string, string> = {};
   for (const c of plan.milestoneCreates) idMap[c.tempId || importTempId(c.data.key)] = createdMilestones[c.data.key] ?? idByKey.get(c.data.key)!;
-  await saveTemplateFlow(ctx, remapFlow(plan.flow, idMap));
+  const flow = remapFlow(plan.flow, idMap);
+  // Written once: a call that comes back after waiting (below) keeps the positions someone moved meanwhile.
+  if (!sameNodes(preFlow, flow)) await saveTemplateFlow(ctx, flow);
+  const postFlow = sameNodes(preFlow, flow) ? preFlow : await readFlowFresh(ctx.repo);
+  if (!sameNodes(postFlow, flow)) return notYet();
   const current = await readTemplateRevision(ctx.repo);
   const revision = Math.max(current, job.targetRevision);
   if (revision !== current) await ctx.repo.settings.set(SETTINGS.templateRevision, revision);
 
+  // 8. A retry whose query did not show a row yet created it again: before discarding copies, wait until the query
+  // shows every recorded row, so an earlier copy (created before them) shows too. After a failed write, wait out
+  // COPY_GRACE_MS (the failed write may have saved a row nothing recorded). The flow above already uses the recorded
+  // rows; the waiting calls only finish the job.
+  const nowMs = Date.parse(ctx.now);
+  const failedRecently = !!job.failedAt && nowMs - Date.parse(job.failedAt) < COPY_GRACE_MS;
+  const createdRecently = !!job.lastCreateAt && nowMs - Date.parse(job.lastCreateAt) < COPY_GRACE_MS;
+  const hidden = unseenM.length + unseenF.length > 0;
+  if ((failedRecently || (createdRecently && hidden)) && (job.copyWaits ?? 0) < COPY_WAIT_LIMIT) {
+    job.copyWaits = (job.copyWaits ?? 0) + 1;
+    const outcome = await save(progress);
+    if (outcome !== "saved") return stopped(outcome);
+    if (failedRecently) await jobPause(JOB_LOOKUP.waitMs);
+    return notYet("Checking Notion for duplicate rows", failedRecently ? undefined : JOB_LOOKUP.waitMs);
+  }
+
+  // 9. Second copies, the seed marker, then History and the tombstone.
   const s = plan.summary;
   const parts = [
     s.added.length ? `${s.added.length} added` : "",
@@ -412,7 +688,12 @@ export async function continueImport(ctx: Ctx, opId: string): Promise<JobStepRes
   // Every other finalize write comes before the History row, which only the tombstone follows: a failure before the
   // row leaves nothing for the retry to log twice. (Only a failure of the row itself or of the tombstone still can:
   // the check before appending is a query that may not show the row yet.)
-  await discardImportCopies(ctx, job, milestones, createdMilestones, createdFields);
+  const after = await recheckJob<ImportJob>(call, opId, sameAsStored);
+  if (after === "finished") return doneResult();
+  if (after !== "same") return after === "changed" ? notYet() : after;
+  const kept = new Set([...Object.values(createdMilestones), ...Object.values(createdFields)]);
+  const protect = new Set([...kept, ...Object.keys(preFlow.nodes), ...Object.keys(postFlow.nodes)]);
+  await discardImportCopies(ctx, job, copiesOf(job, milestones, createdMilestones), fieldCopiesOf(job, fieldsNow, createdFields), protect);
   if (job.reason !== "import") await ctx.repo.settings.set(SETTINGS.seedAppliedAt, ctx.now);
   await appendHistory(
     ctx,
@@ -427,40 +708,109 @@ export async function continueImport(ctx: Ctx, opId: string): Promise<JobStepRes
     },
     { opId: job.opId },
   );
-  await finishJob(ctx, job, { revision, did });
-  return stepResult(true, job.total, job.total, "Template updated");
+  // The tombstone keeps the record: an import that overlapped this one must not discard these rows (see discardImportCopies).
+  const result: ImportResult = { revision, did, reason: job.reason, createdMilestones, createdFields };
+  await finishJob(ctx, job, result as Record<string, unknown>);
+  return doneResult();
+}
+
+/** The template flow as Notion has it now (the Settings row read again by its page id). */
+async function readFlowFresh(repo: Repo): Promise<Flow> {
+  const flow = await repo.settings.get<Flow>(SETTINGS.templateFlow, { fresh: true });
+  if (!flow || typeof flow !== "object") return { nodes: {}, edges: [] };
+  return { nodes: { ...(flow.nodes ?? {}) }, edges: [...(flow.edges ?? [])] };
+}
+
+/** Same milestones and arrows (positions aside). */
+function sameNodes(a: Flow, b: Flow): boolean {
+  const ids = (f: Flow) => Object.keys(f.nodes).sort().join(",");
+  const edges = (f: Flow) => f.edges.map((e) => `${e.id}:${e.from}>${e.to}:${e.archivedAt ?? ""}`).sort().join(",");
+  return ids(a) === ids(b) && edges(a) === edges(b);
+}
+
+/** A milestone still exactly as the plan creates it (nobody renamed, re-described, reordered or re-typed it). */
+function matchesPlannedMilestone(m: Milestone, planned: MilestoneInput): boolean {
+  return (
+    !m.archived &&
+    m.name === planned.name &&
+    m.fieldType === planned.fieldType &&
+    (m.description ?? "") === (planned.description ?? "") &&
+    stableStringify(m.choices ?? []) === stableStringify(planned.choices ?? []) &&
+    stableStringify(m.config ?? {}) === stableStringify(planned.config ?? {}) &&
+    m.order === planned.order
+  );
+}
+
+/** A project field still exactly as the plan creates it. */
+function matchesPlannedField(f: ProjectField, planned: ProjectFieldInput): boolean {
+  return (
+    !f.archived &&
+    f.label === planned.label &&
+    f.fieldType === planned.fieldType &&
+    stableStringify(f.choices ?? []) === stableStringify(planned.choices ?? []) &&
+    stableStringify(f.config ?? {}) === stableStringify(planned.config ?? {}) &&
+    !!f.showInSummary === !!planned.showInSummary &&
+    (f.systemKey ?? null) === (planned.systemKey ?? null) &&
+    f.order === planned.order
+  );
 }
 
 /**
- * Second copies of milestones and project fields this import created (same key, not the recorded row, same name and
- * type as planned, created since the job started) go to Notion's trash: a retried batch whose query did not show the
- * first copy yet created them.
+ * Second copies of milestones this import planned (same key, not the recorded row, created since the job started):
+ * a retried batch whose query did not show the first copy yet created them.
+ */
+function copiesOf(job: ImportJob, milestones: Milestone[], recorded: Record<string, string>): string[] {
+  const since = new Date(Math.floor(Date.parse(job.createdAt) / 60_000) * 60_000).toISOString(); // Notion: minutes only
+  const planned = new Set(job.plan.milestoneCreates.map((c) => c.data.key));
+  return milestones.filter((m) => planned.has(m.key) && recorded[m.key] !== m.id && !m.archived && m.createdAt >= since).map((m) => m.id);
+}
+
+/** The same for project fields (a field with a key the plan creates did not exist when the job was planned). */
+function fieldCopiesOf(job: ImportJob, fields: ProjectField[], recorded: Record<string, string>): string[] {
+  const planned = new Set(job.plan.projectFieldCreates.map((f) => f.key));
+  return fields.filter((f) => planned.has(f.key) && recorded[f.key] !== f.id && !f.archived).map((f) => f.id);
+}
+
+/**
+ * Moves second copies of milestones and project fields to Notion's trash, when nothing refers to them: not `protect`
+ * (this job's record), not the template flow as Notion has it now, not the record of another import that is still
+ * running or finished after this one started, no project's
+ * details (fields), and still exactly as this job's plan creates them (each read again by id first). Rows another
+ * import created, or that someone changed, therefore stay.
  */
 async function discardImportCopies(
   ctx: Ctx,
   job: ImportJob,
-  milestones: Milestone[],
-  createdMilestones: Record<string, string>,
-  createdFields: Record<string, string>,
+  milestoneIds: string[],
+  fieldIds: string[],
+  protect: ReadonlySet<string>,
 ): Promise<void> {
-  const { plan } = job;
-  const since = new Date(Math.floor(Date.parse(job.createdAt) / 60_000) * 60_000).toISOString(); // Notion: minutes only
-  const plannedMilestone = new Map(plan.milestoneCreates.map((c) => [c.data.key, c.data]));
-  const milestoneCopies = milestones.filter((m) => {
-    const planned = plannedMilestone.get(m.key);
-    const keep = createdMilestones[m.key];
-    return (
-      planned && keep && keep !== m.id && !m.archived && m.name === planned.name && m.fieldType === planned.fieldType && m.createdAt >= since
-    );
-  });
-  const plannedField = new Map(plan.projectFieldCreates.map((f) => [f.key, f]));
-  const fieldCopies = plannedField.size
-    ? (await ctx.repo.projectFields.list({ includeArchived: true })).filter((f) => {
-        const planned = plannedField.get(f.key);
-        const keep = createdFields[f.key];
-        return planned && keep && keep !== f.id && !f.archived && f.label === planned.label && f.fieldType === planned.fieldType;
-      })
-    : [];
-  for (const m of milestoneCopies) await ctx.repo.milestones.discard(m.id);
-  for (const f of fieldCopies) await ctx.repo.projectFields.discard(f.id);
+  let m = [...new Set(milestoneIds)].filter((id) => !protect.has(id));
+  let f = [...new Set(fieldIds)].filter((id) => !protect.has(id));
+  if (m.length === 0 && f.length === 0) return;
+  const others = new Set(Object.keys((await readFlowFresh(ctx.repo)).nodes));
+  for (const j of await otherImports(ctx, job.opId, job.createdAt)) {
+    const r = recordsOf(j);
+    for (const id of [...Object.values(r.milestones), ...Object.values(r.fields)]) others.add(id);
+  }
+  m = m.filter((id) => !others.has(id));
+  f = f.filter((id) => !others.has(id));
+  if (f.length) {
+    const used = new Set((await ctx.repo.projects.list({ includeArchived: true })).flatMap((p) => Object.keys(p.details ?? {})));
+    f = f.filter((id) => !used.has(id));
+  }
+  const plannedMilestone = new Map(job.plan.milestoneCreates.map((c) => [c.data.key, c.data as MilestoneInput]));
+  const plannedField = new Map(job.plan.projectFieldCreates.map((x) => [x.key, x as ProjectFieldInput]));
+  const [nowM, nowF] = await Promise.all([
+    settleAll(m.map((id) => () => ctx.repo.milestones.get(id))),
+    settleAll(f.map((id) => () => ctx.repo.projectFields.get(id))),
+  ]);
+  for (const row of nowM) {
+    const planned = row ? plannedMilestone.get(row.key) : undefined;
+    if (row && planned && matchesPlannedMilestone(row, planned)) await ctx.repo.milestones.discard(row.id);
+  }
+  for (const row of nowF) {
+    const planned = row ? plannedField.get(row.key) : undefined;
+    if (row && planned && matchesPlannedField(row, planned)) await ctx.repo.projectFields.discard(row.id);
+  }
 }

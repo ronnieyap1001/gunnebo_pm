@@ -182,6 +182,9 @@ export function createMemoryRepo(opts: MemoryRepoOptions = {}): MemoryRepo {
         const rows = [...store.projectFields.values()].sort((a, b) => a.order - b.order);
         return json(filterArchived(rows, o));
       },
+      async get(id) {
+        return json(store.projectFields.get(id) ?? null);
+      },
       async create(input: ProjectFieldInput) {
         write("projectFields.create");
         const row: ProjectField = { ...json(input), id: randomUUID() };

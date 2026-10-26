@@ -162,11 +162,69 @@ export function planFieldRetype(
 /** More projects than this: the Notion mirrors a field change affects are left to Settings → Repair mirrors. */
 export const MIRROR_REFRESH_LIMIT = 30;
 
-export interface UpdatedProjectField extends ProjectField {
+/** What a project-field change did to the Notion mirrors of projects. */
+export interface FieldMirrorsResult {
   /** Projects whose Notion mirrors (Customer, Project type, Summary) were rewritten because of this change. */
   mirrorsUpdated?: number;
   /** Plain English, set when more than MIRROR_REFRESH_LIMIT projects are affected: run Repair mirrors. */
   mirrorsNote?: string;
+}
+
+export interface UpdatedProjectField extends ProjectField, FieldMirrorsResult {}
+
+interface MirrorWrite {
+  project: Project;
+  mirrors: ProjectMirrors;
+}
+
+/** A project's detail mirrors under the fields `after`, or null when they are the same as under `before`. */
+function changedMirrors(before: ProjectField[], after: ProjectField[], p: Project, details: Record<string, Value | null>) {
+  const next = projectDetailMirrors(after, details);
+  return stableStringify(next) !== stableStringify(projectDetailMirrors(before, p.details ?? {})) ? next : null;
+}
+
+/**
+ * The projects whose Notion mirrors change when the project fields go from `before` to `after` (projects in `skip` are
+ * written elsewhere). More than MIRROR_REFRESH_LIMIT: none, and a note that says to run Settings → Repair mirrors.
+ */
+function planMirrorRefresh(
+  before: ProjectField[],
+  after: ProjectField[],
+  projects: Project[],
+  skip?: ReadonlySet<string>,
+): { writes: MirrorWrite[]; note?: string } {
+  const writes: MirrorWrite[] = [];
+  for (const p of projects) {
+    if (skip?.has(p.id)) continue;
+    const mirrors = changedMirrors(before, after, p, p.details ?? {});
+    if (mirrors) writes.push({ project: p, mirrors });
+  }
+  if (writes.length <= MIRROR_REFRESH_LIMIT) return { writes };
+  return {
+    writes: [],
+    note: `The Customer, Project type and Summary columns in Notion of ${writes.length} projects still show the old values. Run Settings → Repair mirrors to update them.`,
+  };
+}
+
+/** Derived data only: in parallel (the Notion client keeps 3 in flight). Throws the first failure. */
+async function writeMirrors(ctx: Ctx, writes: MirrorWrite[]): Promise<number> {
+  const written = await settleSome(writes.map(({ project, mirrors }) => () => ctx.repo.projects.update(project.id, { mirrors })));
+  if (written.error) throw written.error;
+  return writes.length;
+}
+
+/**
+ * Archiving or restoring a field shown in the summary changes the Summary line of every project with a value in it
+ * (the line lists active fields only), so their Notion mirrors are rewritten, with the same limit and note as a field
+ * edit. Called before the field itself changes: a retry with the same opId works the change out again.
+ */
+async function refreshMirrorsForArchive(ctx: Ctx, all: ProjectField[], id: string, archived: boolean): Promise<FieldMirrorsResult> {
+  if (!all.find((x) => x.id === id)?.showInSummary) return {};
+  const after = all.map((x) => (x.id === id ? { ...x, archived } : x));
+  const plan = planMirrorRefresh(all, after, await ctx.repo.projects.list({ includeArchived: true }));
+  if (plan.note) return { mirrorsNote: plan.note };
+  const updated = await writeMirrors(ctx, plan.writes);
+  return updated ? { mirrorsUpdated: updated } : {};
 }
 
 /**
@@ -247,24 +305,14 @@ export async function updateProjectField(ctx: Ctx, id: string, patch: ProjectFie
   const touchesMirrors =
     (f.systemKey !== undefined || f.showInSummary || next.showInSummary === true) &&
     (["choices", "fieldType", "config", "showInSummary", "order"] as const).some((k) => k in next);
-  const converted = new Map(conversions.map((c) => [c.projectId, c.value]));
-  const mirrorsAfter = (p: Project, details: Record<string, Value | null>) => {
-    const after = projectDetailMirrors(fieldsAfter, details);
-    return stableStringify(after) !== stableStringify(projectDetailMirrors(allFields, p.details ?? {})) ? after : null;
-  };
-  let mirrorOnly: { project: Project; mirrors: ProjectMirrors }[] = [];
+  let mirrorOnly: MirrorWrite[] = [];
+  let mirrorsNote: string | undefined;
   if (touchesMirrors) {
     projects ??= await ctx.repo.projects.list({ includeArchived: true });
-    for (const p of projects) {
-      if (converted.has(p.id)) continue; // written together with the converted value below
-      const m = mirrorsAfter(p, p.details ?? {});
-      if (m) mirrorOnly.push({ project: p, mirrors: m });
-    }
-  }
-  let mirrorsNote: string | undefined;
-  if (mirrorOnly.length > MIRROR_REFRESH_LIMIT) {
-    mirrorsNote = `The Customer, Project type and Summary columns in Notion of ${mirrorOnly.length} projects still show the old values. Run Settings → Repair mirrors to update them.`;
-    mirrorOnly = [];
+    // Converted projects are written together with their converted value below.
+    const plan = planMirrorRefresh(allFields, fieldsAfter, projects, new Set(conversions.map((c) => c.projectId)));
+    mirrorOnly = plan.writes;
+    mirrorsNote = plan.note;
   }
 
   // Write order: project values (converted) → History → mirrors → field. A retry after a crash at any point finishes
@@ -276,7 +324,7 @@ export async function updateProjectField(ctx: Ctx, id: string, patch: ProjectFie
     const p = await ctx.repo.projects.get(c.projectId);
     if (!p) continue;
     const details = { ...(p.details ?? {}), [id]: c.value };
-    const mirrors = touchesMirrors ? mirrorsAfter(p, details) : null;
+    const mirrors = touchesMirrors ? changedMirrors(allFields, fieldsAfter, p, details) : null;
     if (mirrors) mirrorsUpdated++;
     await ctx.repo.projects.update(p.id, mirrors ? { details, mirrors } : { details });
   }
@@ -295,10 +343,8 @@ export async function updateProjectField(ctx: Ctx, id: string, patch: ProjectFie
       },
     });
   }
-  // Derived data only: in parallel (the Notion client keeps 3 in flight); a failure stops before the field changes.
-  const written = await settleSome(mirrorOnly.map(({ project, mirrors }) => () => ctx.repo.projects.update(project.id, { mirrors })));
-  if (written.error) throw written.error;
-  mirrorsUpdated += mirrorOnly.length;
+  // A failure stops before the field changes.
+  mirrorsUpdated += await writeMirrors(ctx, mirrorOnly);
   const updated: UpdatedProjectField = await ctx.repo.projectFields.update(id, next);
   if (mirrorsUpdated) updated.mirrorsUpdated = mirrorsUpdated;
   if (mirrorsNote) updated.mirrorsNote = mirrorsNote;
@@ -323,24 +369,32 @@ export async function addProjectFieldChoice(
   return { field, choiceId };
 }
 
-export async function archiveProjectField(ctx: Ctx, id: string): Promise<void> {
-  const f = await requireField(ctx, id);
+/**
+ * Archives a project field (values in projects are kept). A field shown in the summary leaves the Summary line, so the
+ * Notion mirrors of the projects with a value in it are rewritten (see refreshMirrorsForArchive).
+ */
+export async function archiveProjectField(ctx: Ctx, id: string): Promise<FieldMirrorsResult> {
+  const { field: f, all } = await requireFieldAmong(ctx, id);
   if (f.systemKey) {
     throw new AppError("FORBIDDEN", `"${f.label}" is used by the Portfolio filters and can't be archived. You can rename it.`);
   }
-  if (f.archived) return;
-  // History → field (as for every toggle): a retry with the same opId finishes an interrupted archive with one row.
+  if (f.archived) return {};
+  // History → mirrors → field (as for every toggle): a retry with the same opId finishes an interrupted archive with
+  // one row, and works the mirrors out again from the field as it still is.
   await appendHistory(ctx, {
     type: EV.projectFieldArchived,
     summary: fieldSummary(`Archived project field "${f.label}"`),
     data: { fieldId: id, key: f.key },
   });
+  const mirrors = await refreshMirrorsForArchive(ctx, all, id, true);
   await ctx.repo.projectFields.update(id, { archived: true, archivedAt: ctx.now });
+  return mirrors;
 }
 
-export async function restoreProjectField(ctx: Ctx, id: string): Promise<void> {
+/** Restores a project field; a field shown in the summary comes back into the projects' Summary mirrors. */
+export async function restoreProjectField(ctx: Ctx, id: string): Promise<FieldMirrorsResult> {
   const { field: f, all } = await requireFieldAmong(ctx, id);
-  if (!f.archived) return;
+  if (!f.archived) return {};
   // Restoring must not leave two active fields with the same name (one may have been created after this was archived).
   assertLabelFree(all, f.label, f.id, { restoring: true });
   await appendHistory(ctx, {
@@ -348,7 +402,9 @@ export async function restoreProjectField(ctx: Ctx, id: string): Promise<void> {
     summary: fieldSummary(`Restored project field "${f.label}"`),
     data: { fieldId: id, key: f.key },
   });
+  const mirrors = await refreshMirrorsForArchive(ctx, all, id, false);
   await ctx.repo.projectFields.update(id, { archived: false, archivedAt: undefined });
+  return mirrors;
 }
 
 /** Display of a project detail value (summary line, Projects table). */

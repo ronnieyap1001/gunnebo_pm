@@ -37,11 +37,12 @@ import {
  * then by the id saved in Settings 'schema.registry', then by name, so renaming a property in Notion
  * never breaks the app.
  *
- * Caching: `createRegistryHandle` memoises the registry per instance (complete: 1 h, or 1 min with a shared loader;
- * incomplete: 10 s) and accepts an external `loader`: the app wraps `discoverShareableRegistry` with Next's
- * unstable_cache (src/server/queries/cached.ts; this module does not import next/*), so every server instance shares
- * one discovery. Only a ready registry is shared. After a stale-id error the memo is dropped and the next load
- * bypasses the external loader once.
+ * Caching: `createRegistryHandle` memoises the registry per instance (ready: 1 h, or 1 min with a shared loader; not
+ * ready: 10 s) and accepts an external `loader`: the app wraps `discoverRegistry` with Next's unstable_cache
+ * (src/server/queries/cached.ts; this module does not import next/*), so every server instance shares one discovery.
+ * Only a ready shared copy is trusted: a copy that is not ready, or one discovered before this instance's last reset
+ * (a stale-id error, Setup, Check again), is checked with a direct discovery, and the shared copy is dropped when it
+ * turns out to be out of date. After a reset the next load also bypasses the external loader once.
  */
 
 export interface DbEntry {
@@ -343,7 +344,11 @@ async function readSavedMap(notion: NotionLike, settings: DbEntry | undefined): 
     if (!row) return null;
     const saved = richTextToJson<SavedMap | null>(propValueRichText(propById(row, settings.props.value)), null);
     return saved && saved.v === 1 ? saved : null;
-  } catch {
+  } catch (e) {
+    // A busy or silent Notion, or a rejected token, is not "the map was never saved": the discovery fails, so status()
+    // says "try again" (or "copy the secret again") instead of sending people to Setup. Anything else reads as no map.
+    const mapped = mapNotionError(e);
+    if (mapped instanceof NotionBusyError || mapped instanceof NotionUnavailableError || mapped instanceof NotConfiguredError) throw mapped;
     return null;
   }
 }
@@ -781,25 +786,32 @@ export interface RegistryHandle {
 
 export interface RegistryHandleOptions extends RegistryOptions {
   /**
-   * A cache shared by every server instance, e.g. `unstable_cache(() => discoverShareableRegistry(getNotion()),
-   * ['schema', String(SCHEMA_VERSION)], { tags: ['schema'], revalidate: 3600 })`. It may throw UnsharedRegistry (a
-   * registry that must not be shared is then used by this instance only); any other error that is not a Notion error
-   * (the cache itself is unavailable) falls back to a direct discovery.
+   * A cache shared by every server instance, e.g. `unstable_cache(() => discoverRegistry(getNotion()),
+   * ['schema', String(SCHEMA_VERSION)], { tags: ['schema'], revalidate: 3600 })`. Its registry is used as is when it
+   * is ready and was discovered after this instance's last reset, or when this very call discovered it (a cache miss);
+   * otherwise the handle discovers directly and calls `onReset` when the shared copy is out of date. The loader may
+   * also throw UnsharedRegistry (that registry is then used by this instance only); any other error that is not a
+   * Notion error (the cache itself is unavailable) falls back to a direct discovery.
    */
   loader?: () => Promise<Registry>;
-  /** Called after reset() (e.g. to revalidateTag('schema') where allowed). */
+  /**
+   * Drops the shared copy (e.g. revalidateTag('schema')): called after reset(), and when a direct discovery shows that
+   * the shared copy is out of date. Must not throw.
+   */
   onReset?: () => void;
 }
 
 const COMPLETE_TTL_MS = 3_600_000;
 /** With a shared loader the instance memo is short: a reset on another instance reaches this one within a minute. */
 const SHARED_TTL_MS = 60_000;
+/** A registry that is not ready is checked again soon: Setup, or a fix in Notion, may have changed it since. */
 const INCOMPLETE_TTL_MS = 10_000;
 const handles = new Set<RegistryHandle>();
 
 /**
  * Thrown by a shared-cache loader for a registry that must not be cached for every instance (setup not finished, or
- * no parent page): the handle uses `registry` for this instance only, with the short memo of an incomplete registry.
+ * no parent page): the handle uses `registry` for this instance only, with the short memo of a registry that is not
+ * ready.
  */
 export class UnsharedRegistry extends Error {
   constructor(readonly registry: Registry) {
@@ -815,42 +827,72 @@ function unsharedRegistryOf(e: unknown): Registry | null {
   return x && x.name === "UnsharedRegistry" && x.registry && typeof x.registry === "object" ? (x.registry as Registry) : null;
 }
 
-/** Discovery for a cache shared by all instances: returns only a ready registry; any other is thrown as UnsharedRegistry. */
+/**
+ * Discovery for a cache that must hold only ready registries: any other is thrown as UnsharedRegistry. (The app's
+ * cache holds every registry instead, so that its hourly refresh can replace a ready copy that went out of date.)
+ */
 export async function discoverShareableRegistry(notion: NotionLike, options?: RegistryOptions): Promise<Registry> {
   const reg = await discoverRegistry(notion, options);
   if (!isSchemaReady(reg)) throw new UnsharedRegistry(reg);
   return reg;
 }
 
+function discoveredAtMs(reg: Registry): number {
+  const t = Date.parse(reg.discoveredAt);
+  return Number.isNaN(t) ? 0 : t;
+}
+
 export function createRegistryHandle(notion: NotionLike, opts: RegistryHandleOptions = {}): RegistryHandle {
-  let memo: { reg: Registry; at: number } | null = null;
+  let memo: { reg: Registry; ready: boolean; at: number } | null = null;
   let inflight: Promise<Registry> | null = null;
   let bypassLoader = false;
+  /** When this instance last dropped its registry (0: never). A shared copy discovered before then may be the one it dropped. */
+  let resetAt = 0;
+
+  const dropShared = () => {
+    try {
+      opts.onReset?.();
+    } catch {
+      // A cache hook must never turn a recoverable reset into a failure.
+    }
+  };
 
   const fresh = async (): Promise<Registry> => {
     const viaLoader = opts.loader && !bypassLoader;
     bypassLoader = false;
     if (!viaLoader) return discoverRegistry(notion, opts);
+    const startedAt = Date.now();
+    let shared: Registry;
     try {
-      return await opts.loader!();
+      shared = await opts.loader!();
     } catch (e) {
       const own = unsharedRegistryOf(e);
       if (own) return own;
       if (e instanceof NotionError) throw e;
       return discoverRegistry(notion, opts);
     }
+    const at = discoveredAtMs(shared);
+    const sharedReady = isSchemaReady(shared);
+    // Discovered by this very call (a cache miss), or ready and newer than this instance's last reset: use it.
+    if (at >= startedAt || (sharedReady && at >= resetAt)) return shared;
+    // A ready copy from before the reset is the one that just failed here; an older copy that is not ready may be out of
+    // date (Setup ran, or Notion was fixed by hand). Ask Notion directly, and drop the shared copy when it is wrong, so
+    // the next load on any instance discovers again (both not ready: nothing better to share yet).
+    const reg = await discoverRegistry(notion, opts);
+    if (sharedReady || isSchemaReady(reg)) dropShared();
+    return reg;
   };
 
   const handle: RegistryHandle = {
     async load() {
       if (memo) {
-        const ttl = !isComplete(memo.reg) ? INCOMPLETE_TTL_MS : opts.loader ? SHARED_TTL_MS : COMPLETE_TTL_MS;
+        const ttl = !memo.ready ? INCOMPLETE_TTL_MS : opts.loader ? SHARED_TTL_MS : COMPLETE_TTL_MS;
         if (Date.now() - memo.at < ttl) return memo.reg;
       }
       if (!inflight) {
         inflight = fresh()
           .then((reg) => {
-            memo = { reg, at: Date.now() };
+            memo = { reg, ready: isSchemaReady(reg), at: Date.now() };
             return reg;
           })
           .finally(() => {
@@ -874,11 +916,8 @@ export function createRegistryHandle(notion: NotionLike, opts: RegistryHandleOpt
     reset() {
       memo = null;
       bypassLoader = true;
-      try {
-        opts.onReset?.();
-      } catch {
-        // A cache hook must never turn a recoverable reset into a failure.
-      }
+      resetAt = Date.now();
+      dropShared();
     },
   };
   handles.add(handle);
@@ -957,17 +996,33 @@ export function simplifyValue(v: PropValue): unknown {
   }
 }
 
-export function createStorageAdmin(notion: NotionLike | (() => NotionLike), handle: RegistryHandle | (() => RegistryHandle), options?: RegistryOptions): StorageAdmin {
+/** An extra of the storage admin below (not part of StorageAdmin). */
+export interface SeedNotice {
+  /**
+   * 'seed.appliedAt' exists in the Settings database of the last status() call although Notion's query does not show
+   * it yet (the instance that just wrote it read it by its page id): status() reports seeded from now on.
+   */
+  noteSeeded(): void;
+}
+
+export function createStorageAdmin(
+  notion: NotionLike | (() => NotionLike),
+  handle: RegistryHandle | (() => RegistryHandle),
+  options?: RegistryOptions,
+): StorageAdmin & SeedNotice {
   const n = () => (typeof notion === "function" ? notion() : notion);
   const h = () => (typeof handle === "function" ? handle() : handle);
   // 'seed.appliedAt' never goes away except through trashAll / resetCaches: once seen in a Settings database,
   // status() stops querying it (until the registry names another Settings database, e.g. after Start over elsewhere).
   let seededIn: string | null = null;
+  // The Settings data source the last status() call looked at (what noteSeeded marks).
+  let lastSettingsDs: string | null = null;
 
   return {
     async status(): Promise<SetupStatus> {
       const mode = options?.mode ?? storageMode();
       const empty = DB_ORDER.map((k) => ({ name: SCHEMA[k].title, ok: false }));
+      lastSettingsDs = null;
       if (mode === "unconfigured") {
         return { mode, problems: [new NotConfiguredError().message], databases: empty, schemaReady: false, seeded: false };
       }
@@ -991,6 +1046,7 @@ export function createStorageAdmin(notion: NotionLike | (() => NotionLike), hand
           seeded = row !== null;
           seededIn = seeded ? settingsDs : null;
         }
+        lastSettingsDs = settingsDs;
         const warnings = [...reg.warnings];
         const tidy = cosmeticWork(reg);
         if (tidy.length) warnings.push(`Setup has small fixes for the Notion databases (${tidy.join("; ")}). Open Setup to apply them.`);
@@ -1016,6 +1072,10 @@ export function createStorageAdmin(notion: NotionLike | (() => NotionLike), hand
               : undefined;
         return { mode, problems: [mapped.message], databases: empty, schemaReady: false, seeded: false, ...(errorKind ? { errorKind } : {}) };
       }
+    },
+
+    noteSeeded() {
+      if (lastSettingsDs) seededIn = lastSettingsDs;
     },
 
     async runSchemaStep(): Promise<SetupStepResult> {

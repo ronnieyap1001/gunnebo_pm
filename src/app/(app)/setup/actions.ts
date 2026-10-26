@@ -6,6 +6,7 @@ import { fail, type ActionResult } from "@/lib/action-result";
 import { runAction, runQuery } from "@/server/actions/run";
 import { TAGS, type SetupStatusDTO } from "@/server/queries";
 import { getStorageAdmin } from "@/server/repo";
+import { isDriverId, progressOf } from "@/server/services/jobs";
 import { readSetupStatus } from "./status";
 import { continueCreateProject, continueImport, continueSync, startSeed, type JobStepResult } from "@/server/services";
 
@@ -52,26 +53,32 @@ export async function startSeedAction(opId: string): Promise<ActionResult<{ tota
   }, { tags: DATA_TAGS });
 }
 
-/** Next batch of an import job (seed, reset or file import). Same opId as the job. */
-export async function continueImportAction(opId: string): Promise<ActionResult<JobStepResult>> {
+/**
+ * Next batch of an import job (seed, reset or file import). Same opId as the job; `driver` is the browser run
+ * (runJob): while another tab or window runs the job, the result has code RUNNING_ELSEWHERE.
+ */
+export async function continueImportAction(opId: string, driver?: string): Promise<ActionResult<JobStepResult>> {
   if (!id.safeParse(opId).success) return fail("This task is missing its id. Reload the page and try again.", "VALIDATION");
-  return runAction(opId, (ctx) => continueImport(ctx, opId), { tags: DATA_TAGS });
+  if (!isDriverId(driver)) return fail("This task's window id is not valid. Reload the page and try again.", "VALIDATION");
+  return runAction(opId, (ctx) => continueImport(ctx, opId, { driver: driver ?? undefined }), { tags: DATA_TAGS });
 }
 
 /** Resumes a project creation that was interrupted (e.g. the tab was closed). */
-export async function continueCreateProjectAction(opId: string): Promise<ActionResult<JobStepResult & { projectId: string }>> {
+export async function continueCreateProjectAction(opId: string, driver?: string): Promise<ActionResult<JobStepResult & { projectId: string }>> {
   if (!id.safeParse(opId).success) return fail("This task is missing its id. Reload the page and try again.", "VALIDATION");
+  if (!isDriverId(driver)) return fail("This task's window id is not valid. Reload the page and try again.", "VALIDATION");
   return runAction(opId, async (ctx) => {
-    const r = await continueCreateProject(ctx, opId);
-    return { done: r.done, message: r.message, fraction: r.fraction, total: r.total, doneCount: r.doneCount, projectId: r.projectId };
+    const r = await continueCreateProject(ctx, opId, { driver: driver ?? undefined });
+    return { ...progressOf(r), projectId: r.projectId };
   });
 }
 
 /** Resumes a "Sync from template" that was interrupted. */
-export async function continueSyncAction(opId: string): Promise<ActionResult<JobStepResult & { projectId: string }>> {
+export async function continueSyncAction(opId: string, driver?: string): Promise<ActionResult<JobStepResult & { projectId: string }>> {
   if (!id.safeParse(opId).success) return fail("This task is missing its id. Reload the page and try again.", "VALIDATION");
+  if (!isDriverId(driver)) return fail("This task's window id is not valid. Reload the page and try again.", "VALIDATION");
   return runAction(opId, async (ctx) => {
-    const r = await continueSync(ctx, opId);
-    return { done: r.done, message: r.message, fraction: r.fraction, total: r.total, doneCount: r.doneCount, projectId: r.projectId };
+    const r = await continueSync(ctx, opId, { driver: driver ?? undefined });
+    return { ...progressOf(r), projectId: r.projectId };
   }, { tags: DATA_TAGS });
 }

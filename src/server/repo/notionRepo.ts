@@ -1109,6 +1109,12 @@ export function createNotionRepo(notion: NotionLike, registry: RegistryHandle | 
           });
           return pages.map((p) => toProjectField(new Row(p, e)));
         }),
+      get: (id) =>
+        call(async (reg) => {
+          const e = entry(reg, "projectFields");
+          const p = await getPage(e, id);
+          return p ? toProjectField(new Row(p, e)) : null;
+        }),
       create: (input) =>
         call(async (reg) => {
           const e = entry(reg, "projectFields");

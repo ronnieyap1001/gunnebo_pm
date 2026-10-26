@@ -31,10 +31,13 @@ export const MAX_IMPORT_BYTES = 1024 * 1024;
 
 const plural = (n: number, one: string, many = `${one}s`) => `${n} ${n === 1 ? one : many}`;
 
-/** A job step for runJob: network errors count as BUSY (retried with backoff); session/deployment problems stop. */
-function jobStep<T extends JobProgress>(call: () => Promise<ActionResult<T>>): () => Promise<ActionResult<T>> {
-  return async () => {
-    const r = await attempt(call);
+/**
+ * A job step for runJob: network errors count as BUSY (retried with backoff); session/deployment problems stop. The
+ * run's driver id goes to the continue action (it waits while another tab or window runs the same job).
+ */
+function jobStep<T extends JobProgress>(call: (driver: string) => Promise<ActionResult<T>>): (driver: string) => Promise<ActionResult<T>> {
+  return async (driver) => {
+    const r = await attempt(() => call(driver));
     return r.ok || r.code !== "NETWORK" ? r : { ...r, code: "BUSY" };
   };
 }
@@ -101,7 +104,7 @@ export function useTemplateJobs({
       busy.current = true;
       setJobParam({ opId, kind: "import" });
       setProgress({ title: "Importing the template", message: "Starting…", fraction: 0 });
-      const r = await runJob(jobStep(() => continueImportAction(opId)), { onProgress: (p) => report(p) });
+      const r = await runJob(jobStep((driver) => continueImportAction(opId, driver)), { onProgress: (p) => report(p) });
       busy.current = false;
       if (!r.ok && r.code === "STALE_DEPLOYMENT") return reloadToContinue();
       setProgress(null);
@@ -235,7 +238,7 @@ export function useTemplateJobs({
           const s = await withRetry(() => startSyncDefaultsAction(opId, t.projectId));
           if (!s.ok) return s;
           setJobParam({ opId, kind: "sync" });
-          const j = await runJob(jobStep(() => continueSyncAction(opId)), { onProgress: (p) => report(p, prefix, i, n) });
+          const j = await runJob(jobStep((driver) => continueSyncAction(opId, driver)), { onProgress: (p) => report(p, prefix, i, n) });
           return j.ok ? { ok: true, data: s.data.itemCount } : j;
         });
         if (!r.ok && r.code === "STALE_DEPLOYMENT") {
@@ -320,7 +323,7 @@ export function useTemplateJobs({
     void (async () => {
       busy.current = true;
       setProgress({ title: "Finishing the sync", message: "Starting…", fraction: 0 });
-      const r = await runJob(jobStep(() => continueSyncAction(resume.opId)), { onProgress: (p) => report(p) });
+      const r = await runJob(jobStep((driver) => continueSyncAction(resume.opId, driver)), { onProgress: (p) => report(p) });
       busy.current = false;
       if (!r.ok && r.code === "STALE_DEPLOYMENT") return reloadToContinue();
       setProgress(null);

@@ -24,6 +24,8 @@ import { Input } from "@/components/ui/input";
 import { Popover, PopoverContent, PopoverTrigger } from "@/components/ui/popover";
 import { Textarea } from "@/components/ui/textarea";
 import { DateField } from "@/components/fields/value-editor";
+import { PERCENT_HINT } from "@/components/fields/input-hint";
+import { parsePercentInput } from "@/domain/values";
 
 /** Text the user typed for a Number / Percent / Link field, kept until it parses. */
 export type DraftText = Record<string, string>;
@@ -37,6 +39,7 @@ export interface DetailInputProps {
   /** Raw text of Number / Percent / Link inputs. */
   text: string | undefined;
   onText: (text: string) => void;
+  /** Shown by the form under the input, in an element with id `${inputId}-msg` (the input points at it). */
   error?: string;
   today: Ymd;
   /** "Add 'X'" for Dropdown / Multiple fields; resolves to the new choice id (or null when it failed). */
@@ -52,6 +55,36 @@ export function parseNumberText(t: string): number | undefined {
   const s = t.trim().replace(/,/g, "");
   if (!s) return undefined;
   return Number(s);
+}
+
+/**
+ * The value the typed text of a Number / Percent field gives: null when empty, undefined while it is not valid (the
+ * form keeps the last valid value and detailTextError says what is wrong). A percent is read like every other percent
+ * box ("7,5" is a decimal comma and gives 8); a number reads commas as thousands separators ("1,200").
+ */
+export function numberTextValue(fieldType: "NUMBER" | "PERCENT", t: string): NumberValue | PercentValue | null | undefined {
+  if (!t.trim()) return null;
+  if (fieldType === "PERCENT") {
+    const p = parsePercentInput(t);
+    return p === null ? undefined : { percent: p };
+  }
+  const n = parseNumberText(t);
+  return n !== undefined && Number.isFinite(n) ? { number: n } : undefined;
+}
+
+/** What is wrong with the text typed in a Number, Percent or Link field, if anything (empty is fine). */
+export function detailTextError(field: Pick<ProjectField, "fieldType">, t: string): string | undefined {
+  if (!t.trim()) return undefined;
+  switch (field.fieldType) {
+    case "PERCENT":
+      return numberTextValue("PERCENT", t) === undefined ? PERCENT_HINT : undefined;
+    case "NUMBER":
+      return numberTextValue("NUMBER", t) === undefined ? "Enter a number, for example 24." : undefined;
+    case "LINK":
+      return URL_PATTERN.test(t.trim()) ? undefined : "Enter a web address starting with https://";
+    default:
+      return undefined;
+  }
 }
 
 /** The right input for each project field type (FILE is not offered for project fields). */
@@ -143,6 +176,7 @@ export function DetailInput(props: DetailInputProps) {
           }}
           disabled={props.disabled}
           aria-invalid={props.error ? true : undefined}
+          aria-describedby={props.error ? `${props.inputId}-msg` : undefined}
           className="h-8"
         />
       );
@@ -164,15 +198,12 @@ function NumberInput({ field, value, onChange, text, onText, error, inputId, dis
         inputMode="decimal"
         onChange={(e) => {
           onText(e.target.value);
-          const n = parseNumberText(e.target.value);
-          if (n === undefined) onChange(null);
-          else if (Number.isFinite(n)) {
-            if (percent) onChange({ percent: Math.max(0, Math.min(100, Math.round(n))) });
-            else onChange({ number: n });
-          }
+          const v = numberTextValue(field.fieldType === "PERCENT" ? "PERCENT" : "NUMBER", e.target.value);
+          if (v !== undefined) onChange(v);
         }}
         disabled={disabled}
         aria-invalid={error ? true : undefined}
+        aria-describedby={error ? `${inputId}-msg` : undefined}
         className="h-8 w-32 text-right tabular-nums"
       />
       {unit ? <span className="text-sm text-muted-foreground">{unit}</span> : null}

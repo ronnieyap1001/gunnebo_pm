@@ -11,6 +11,7 @@ import {
   type Choice,
   type DropdownValue,
   type MultipleValue,
+  type Note,
   type Project,
   type ProjectField,
   type ProjectStatus,
@@ -28,16 +29,28 @@ import {
   type Ctx,
 } from "./context";
 import {
+  assertJobFits,
   BATCH_SIZE,
+  beginJobCall,
+  claimJob,
+  elsewhereResult,
   finishJob,
   isFinished,
   loadJob,
   loadJobForContinue,
+  mergeRecord,
   newJob,
+  orphansOf,
+  recheckJob,
+  SAMPLE_ID,
+  SAMPLE_LEASE,
+  sameRecord,
   saveJob,
+  saveRunningJob,
   settleSome,
   stepResult,
   type JobBase,
+  type JobCall,
   type JobStepResult,
 } from "./jobs";
 import { getTemplate } from "./library";
@@ -213,7 +226,17 @@ export async function startCreateProject(ctx: Ctx, input: CreateProjectInput): P
     revision: template.revision,
     row,
   };
-  await saveJob(ctx.repo, job);
+  // The job grows as the copy records its steps: refuse up front a template whose copy could not be saved to the end.
+  const later: CreateProjectJob = {
+    ...job,
+    projectId: SAMPLE_ID,
+    created: Object.fromEntries(job.drafts.map((d) => [d.tempId, SAMPLE_ID])),
+    lease: SAMPLE_LEASE,
+  };
+  delete later.row;
+  assertJobFits(job, "Copying this template");
+  assertJobFits(later, "Copying this template");
+  await saveJob(ctx.repo, job, { creates: true });
 
   const project = await ctx.repo.projects.create(row);
   job.projectId = project.id;
@@ -255,17 +278,34 @@ export interface CreateProgress extends JobStepResult {
  * When all exist: remaps the flow to the recorded step ids, builds cells, sets setup READY and progress, moves any
  * second copy of a step to Notion's trash, writes ONE History row `project.created` { revision, nodeCount, edgeCount }
  * and clears the job. Calling again after done is a no-op.
+ *
+ * `driver` identifies the browser run (see claimJob): while another run holds the job, the call only reports
+ * RUNNING_ELSEWHERE. Finalizing works from the record Notion has (read again by page id first), and a second copy is
+ * only discarded when nothing uses it: not the project's flow or cells, and no file, link or note.
  */
-export async function continueCreateProject(ctx: Ctx, opId: string): Promise<CreateProgress> {
-  const job = await loadJobForContinue<CreateProjectJob>(ctx.repo, opId);
-  if (!job || job.kind !== "createProject") throw new AppError("NOT_FOUND", "This project setup was not found. Start again.");
-  if (isFinished(job)) {
-    return { ...stepResult(true, job.total, job.total, "Project ready"), projectId: job.projectId ?? "", created: job.total };
-  }
+export async function continueCreateProject(ctx: Ctx, opId: string, opts: { driver?: string } = {}): Promise<CreateProgress> {
+  const call = beginJobCall(ctx, opts.driver);
+  const loaded = await loadJobForContinue<CreateProjectJob>(ctx.repo, opId);
+  if (!loaded || loaded.kind !== "createProject") throw new AppError("NOT_FOUND", "This project setup was not found. Start again.");
+  const claim = await claimJob(call, loaded);
+  if (claim.wait) return { ...claim.wait, projectId: loaded.projectId ?? "", created: loaded.doneCount };
+  const job = claim.job;
+  const ready = (): CreateProgress => ({
+    ...stepResult(true, job.total, job.total, "Project ready"),
+    projectId: job.projectId ?? "",
+    created: job.total,
+  });
+  if (isFinished(job)) return ready();
   const project = job.projectId ? await requireProject(ctx.repo, job.projectId) : await adoptOrCreateProject(ctx, job);
   const projectId = project.id;
   const total = job.drafts.length;
   const created: Record<string, string> = { ...(job.created ?? {}) };
+  const progress = (n: number): CreateProgress => ({
+    ...stepResult(false, n, total, `Copied ${n} of ${total} milestones`),
+    projectId,
+    created: n,
+  });
+  const countHave = () => job.drafts.filter((d) => created[d.tempId]).length;
 
   // The query only finds what a crashed batch created before the job could record it (when Notion already shows it).
   const listed = await ctx.repo.steps.listByProject(projectId, { includeArchived: true });
@@ -290,23 +330,24 @@ export async function continueCreateProject(ctx: Ctx, opId: string): Promise<Cre
       return ctx.repo.steps.create(input);
     }),
   );
+  const madeHere = new Set<string>();
   results.forEach((s, i) => {
     if (!s) return;
     created[batch[i].tempId] = s.id;
     byId.set(s.id, s);
+    madeHere.add(s.id);
     recorded = true;
   });
-  const have = job.drafts.filter((d) => created[d.tempId]).length;
   if (recorded) {
-    job.created = created;
-    job.doneCount = have;
-    job.updatedAt = ctx.now;
-    await saveJob(ctx.repo, job);
+    const saved = await saveCreated(call, job, created, madeHere, countHave);
+    if (saved !== "saved") {
+      if (error) throw error;
+      return saved === "finished" ? ready() : { ...elsewhereResult(job, job.lease!, call.now()), projectId, created: job.doneCount };
+    }
   }
   if (error) throw error;
-  if (have < total) {
-    return { ...stepResult(false, have, total, `Copied ${have} of ${total} milestones`), projectId, created: have };
-  }
+  const have = countHave();
+  if (have < total) return progress(have);
 
   // All steps exist: finalize with the recorded ids (steps the query does not show yet are read by id).
   const unseen = [...new Set(Object.values(created))].filter((id) => !byId.has(id));
@@ -317,13 +358,18 @@ export async function continueCreateProject(ctx: Ctx, opId: string): Promise<Cre
   const lost = job.drafts.filter((d) => !byId.has(created[d.tempId]));
   if (lost.length) {
     // A recorded step is gone (deleted in Notion meanwhile): forget it, so the next call creates it again.
+    const gone = new Set(lost.map((d) => created[d.tempId]));
     for (const d of lost) delete created[d.tempId];
-    job.created = created;
-    job.doneCount = total - lost.length;
-    job.updatedAt = ctx.now;
-    await saveJob(ctx.repo, job);
-    return { ...stepResult(false, job.doneCount, total, `Copied ${job.doneCount} of ${total} milestones`), projectId, created: job.doneCount };
+    const saved = await saveCreated(call, job, created, new Set(), countHave, gone);
+    if (saved === "finished") return ready();
+    return progress(countHave());
   }
+
+  // Only the record Notion has is finalized: when another call saved a different one meanwhile, the next call goes on
+  // from that one (two finalizing calls then write the same flow).
+  const before = await recheckJob<CreateProjectJob>(call, job.opId, (j) => sameRecord(j.created, created));
+  if (before === "finished") return ready();
+  if (before !== "same") return before === "changed" ? progress(have) : { ...before, projectId, created: have };
   const idMap: Record<string, string> = {};
   const steps: StoredStep[] = [];
   for (const d of job.drafts) {
@@ -333,21 +379,25 @@ export async function continueCreateProject(ctx: Ctx, opId: string): Promise<Cre
   const fresh = await requireProject(ctx.repo, projectId);
   const flow = remapFlow(fresh.flow, idMap);
   const cells = buildCells(steps, {});
-  const progress = progressOfCells(cells, ctx.day).pct;
+  const progressPct = progressOfCells(cells, ctx.day).pct;
   // READY is written together with the remapped flow and the cells, so a READY project was finalized already (a
   // resumed call only completes the History row and the job). Rewriting it would drop changes made since.
   if (fresh.setup !== "READY") {
     await ctx.repo.projects.update(projectId, {
       flow,
       cells,
-      progress,
+      progress: progressPct,
       setup: "READY",
       mirrors: { current: currentMirror(cells, flow, ctx.day) },
     });
   }
   const edgeCount = flow.edges.filter((e) => !e.archivedAt).length;
   // Second copies go first: the History row is the last write before the tombstone (see continueImport).
-  await discardSteps(ctx, findStepCopies(listed, keyedIds(projectId, created), job.opId));
+  const after = await recheckJob<CreateProjectJob>(call, job.opId, (j) => sameRecord(j.created, created));
+  if (after === "finished") return ready();
+  if (after !== "same") return after === "changed" ? progress(have) : { ...after, projectId, created: have };
+  const copies = findStepCopies(listed, keyedIds(projectId, created), job.opId);
+  await discardUnusedCopies(ctx, projectId, copies.map((s) => s.id), new Set(Object.values(created)));
   await appendHistory(
     ctx,
     {
@@ -360,7 +410,37 @@ export async function continueCreateProject(ctx: Ctx, opId: string): Promise<Cre
     { opId: job.opId },
   );
   await finishJob(ctx, job, { projectId });
-  return { ...stepResult(true, total, total, "Project ready"), projectId, created: total };
+  return ready();
+}
+
+/**
+ * Saves the steps a create job recorded, keeping what another call recorded meanwhile (Notion's entry wins for a
+ * step both created). A copy this call made that lost, or that nobody will record because the job finished, is
+ * discarded at once when nothing uses it (see orphansOf).
+ */
+async function saveCreated(
+  call: JobCall,
+  job: CreateProjectJob,
+  created: Record<string, string>,
+  madeHere: Set<string>,
+  countHave: () => number,
+  gone: ReadonlySet<string> = new Set(),
+): Promise<"saved" | "finished" | "elsewhere"> {
+  const lost: string[] = [];
+  job.created = created;
+  job.doneCount = countHave();
+  job.updatedAt = call.ctx.now;
+  const { outcome, stored } = await saveRunningJob(call, job, (s) => {
+    lost.push(...mergeRecord(created, s.created, gone));
+    job.doneCount = countHave();
+  });
+  if (outcome === "elsewhere" && stored) job.lease = stored.lease;
+  const orphans = orphansOf(outcome, lost, madeHere);
+  if (orphans.length && job.projectId) {
+    const keep = new Set(Object.values(outcome === "saved" ? created : (stored?.created ?? {})));
+    await discardUnusedCopies(call.ctx, job.projectId, orphans, keep);
+  }
+  return outcome;
 }
 
 /** stepKey → the step id a job recorded for it. */
@@ -370,23 +450,61 @@ export function keyedIds(projectId: string, created: Record<string, string>): Ma
 
 /**
  * Second copies of steps a job created: rows with one of the job's step keys that are not the recorded step, still
- * exactly as the job created them (lastOp = the job's op, never edited).
+ * exactly as the job created them (lastOp = the job's op, never edited). `referenced`: steps with a file, link or note.
  */
-export function findStepCopies(listed: StoredStep[], recorded: Map<string, string>, opId: string): StoredStep[] {
+export function findStepCopies(
+  listed: StoredStep[],
+  recorded: Map<string, string>,
+  opId: string,
+  referenced: ReadonlySet<string> = new Set(),
+): StoredStep[] {
   return listed.filter((s) => {
     const keep = recorded.get(s.stepKey);
-    return keep !== undefined && keep !== s.id && s.lastOp === opId && untouched(s);
+    return keep !== undefined && keep !== s.id && s.lastOp === opId && untouched(s, referenced);
   });
 }
 
-/** Moves the given second copies to Notion's trash (recoverable there for 30 days; the app never shows them again). */
-export async function discardSteps(ctx: Ctx, copies: StoredStep[]): Promise<void> {
-  await settleAll(copies.map((s) => () => ctx.repo.steps.discard(s.id)));
+/**
+ * Moves second copies to Notion's trash (recoverable there for 30 days; the app never shows them again), after
+ * checking each against Notion as it is now: a copy stays when the project's flow or cells use it, when it has an
+ * active file, link or note, when it is in `keep`, or when it was changed (read again by id).
+ */
+export async function discardUnusedCopies(
+  ctx: Ctx,
+  projectId: string,
+  ids: string[],
+  keep: ReadonlySet<string> = new Set(),
+): Promise<string[]> {
+  const candidates = [...new Set(ids)].filter((id) => !keep.has(id));
+  if (candidates.length === 0) return [];
+  const [project, attachments, notes] = await Promise.all([
+    ctx.repo.projects.get(projectId),
+    ctx.repo.attachments.listByProject(projectId),
+    ctx.repo.notes.listByProject(projectId),
+  ]);
+  const used = new Set([...Object.keys(project?.flow?.nodes ?? {}), ...Object.keys(project?.cells ?? {})]);
+  const referenced = referencedStepIds(project, attachments, notes);
+  const now = await settleAll(candidates.filter((id) => !used.has(id)).map((id) => () => ctx.repo.steps.get(id)));
+  const discard = now.filter((s): s is StoredStep => !!s && s.projectId === projectId && untouched(s, referenced)).map((s) => s.id);
+  await settleAll(discard.map((id) => () => ctx.repo.steps.discard(id)));
+  return discard;
 }
 
-/** A step nobody has changed since it was created (no value, N/A, flag or revision). */
-function untouched(s: StoredStep): boolean {
-  return (s.rev ?? 0) === 0 && (s.value ?? null) === null && !s.notApplicable && !s.flag && !s.archived;
+/**
+ * Steps someone has added something to that a step's own fields do not show: an active file, link or note, or a file
+ * count in the project's cells (written straight away when a file is added, before the Files query shows it).
+ */
+export function referencedStepIds(project: Project | null, attachments: Attachment[], notes: Note[]): Set<string> {
+  const out = new Set<string>();
+  for (const a of attachments) if (a.stepId && !a.archived) out.add(a.stepId);
+  for (const n of notes) if (n.stepId && !n.archived) out.add(n.stepId);
+  for (const [id, cell] of Object.entries(project?.cells ?? {})) if ((cell.fc ?? 0) > 0) out.add(id);
+  return out;
+}
+
+/** A step nobody has changed since it was created (no value, N/A, flag, revision, file, link or note). */
+export function untouched(s: StoredStep, referenced: ReadonlySet<string> = new Set()): boolean {
+  return (s.rev ?? 0) === 0 && (s.value ?? null) === null && !s.notApplicable && !s.flag && !s.archived && !referenced.has(s.id);
 }
 
 /** Runs write thunks in parallel and waits for all of them before throwing the first error (no write left in flight). */
@@ -539,13 +657,15 @@ export interface ReconcileOptions {
  * a retried create) stay out of the cells and go to Notion's trash once the flow uses one copy (see dropStepCopies).
  */
 export async function reconcileProject(ctx: Ctx, projectId: string, opts: ReconcileOptions = {}): Promise<{ changed: boolean }> {
-  const [project, listed, attachments] = await Promise.all([
+  const [project, listed, attachments, notes] = await Promise.all([
     requireProject(ctx.repo, projectId),
     ctx.repo.steps.listByProject(projectId),
     ctx.repo.attachments.listByProject(projectId),
+    ctx.repo.notes.listByProject(projectId),
   ]);
   if (project.setup !== "READY") return { changed: false };
-  const steps = await dropStepCopies(ctx, project, await withKnownSteps(ctx.repo, project, listed));
+  const referenced = referencedStepIds(project, attachments, notes);
+  const steps = await dropStepCopies(ctx, project, await withKnownSteps(ctx.repo, project, listed), referenced);
   const cells = buildCells(steps, countsTrustingRecentCells(ctx, project, attachments));
   const progress = progressOfCells(cells, ctx.day).pct;
   const same = cellsEqual(cells, project.cells ?? {}) && progress === project.progress;
@@ -586,15 +706,20 @@ export async function withKnownSteps(repo: Repo, project: Project, listed: Store
 
 /**
  * Steps sharing a stepKey are copies of one step (a create retried while the query did not show the first one). The
- * copy the project uses (in the flow, else in the cells, else the oldest) stays in the cells; untouched copies outside
- * the flow are left out of them. They go to Notion's trash only once one copy is in the flow: until then a create or
- * sync job may still be running and decides itself which copy it keeps (it records its own). Copies someone has
- * edited stay (nothing is lost; they show as separate steps).
+ * copy the project uses (in the flow, else in the cells, else the oldest) is kept; untouched copies outside the flow
+ * are left out (of the cells, and of the project page). They go to Notion's trash only once one copy is in the flow:
+ * until then a create or sync job may still be running and decides itself which copy it keeps (it records its own).
+ * Copies someone has changed, or added a file, link or note to (`referenced`), stay: nothing is lost; they show as
+ * separate steps.
  */
-async function dropStepCopies(ctx: Ctx, project: Project, steps: StoredStep[]): Promise<StoredStep[]> {
+export function stepCopies(
+  project: Pick<Project, "flow" | "cells">,
+  steps: StoredStep[],
+  referenced: ReadonlySet<string> = new Set(),
+): { leaveOut: Set<string>; discard: string[] } {
   const byKey = new Map<string, StoredStep[]>();
   for (const s of steps) {
-    if (!s.stepKey) continue;
+    if (!s.stepKey || s.archived) continue;
     const group = byKey.get(s.stepKey) ?? [];
     group.push(s);
     byKey.set(s.stepKey, group);
@@ -609,12 +734,21 @@ async function dropStepCopies(ctx: Ctx, project: Project, steps: StoredStep[]): 
     const placed = group.find(inFlow);
     const keeper = placed ?? group.find(inCells) ?? oldest;
     for (const s of group) {
-      if (s === keeper || inFlow(s) || !untouched(s)) continue;
+      if (s === keeper || inFlow(s) || !untouched(s, referenced)) continue;
       leaveOut.add(s.id);
       if (placed) discard.push(s.id);
     }
   }
+  return { leaveOut, discard };
+}
+
+/** Applies stepCopies: discards (each copy read again by id first; one changed meanwhile stays) and leaves out. */
+async function dropStepCopies(ctx: Ctx, project: Project, steps: StoredStep[], referenced: ReadonlySet<string>): Promise<StoredStep[]> {
+  const { leaveOut, discard } = stepCopies(project, steps, referenced);
   if (leaveOut.size === 0) return steps;
-  await settleAll(discard.map((id) => () => ctx.repo.steps.discard(id)));
+  const now = await settleAll(discard.map((id) => () => ctx.repo.steps.get(id)));
+  for (const s of now) if (s && !untouched(s, referenced)) leaveOut.delete(s.id);
+  const still = now.filter((s): s is StoredStep => !!s && untouched(s, referenced)).map((s) => s.id);
+  await settleAll(still.map((id) => () => ctx.repo.steps.discard(id)));
   return steps.filter((s) => !leaveOut.has(s.id));
 }

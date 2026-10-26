@@ -4,7 +4,7 @@ import { useCallback, useRef, useState } from "react";
 import { useRouter } from "next/navigation";
 import { toast } from "sonner";
 import { ProgressDialog } from "@/components/common/progress-dialog";
-import { runJob, type JobProgress } from "@/lib/run-job";
+import { runJob, RUNNING_ELSEWHERE_MESSAGE, type JobProgress } from "@/lib/run-job";
 import { continueCreateProjectAction } from "@/app/(app)/projects/actions";
 import { toastFailure } from "@/components/shell/action-call";
 
@@ -65,11 +65,11 @@ export function useCreateProject(opts: { onStopped?: () => void } = {}) {
       setJobParams({ opId: job.opId, code: job.code });
       let keepOpen = false;
       try {
-        const result = await runJob(() => continueCreateProjectAction(job.opId), {
+        const result = await runJob((driver) => continueCreateProjectAction(job.opId, driver), {
           maxSteps: 200,
           onProgress: (p: JobProgress) => {
             const d = p as JobProgress & { doneCount?: number; total?: number };
-            const message = p.message.startsWith("Notion is busy")
+            const message = p.message.startsWith("Notion is busy") || p.message === RUNNING_ELSEWHERE_MESSAGE
               ? p.message
               : p.done
                 ? "Opening the project…"

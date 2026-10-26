@@ -282,8 +282,10 @@ export function FieldsTab({
       queue: QUEUE.fields,
       optimistic: () => apply({ type: "patch", id: row.id, patch: { archived: false, archivedAt: null } }),
       run: (opId) => restoreProjectFieldAction(opId, row.id),
-      onSuccess: () => {
+      onSuccess: (data) => {
         toast.success(`Restored “${row.label}”`);
+        // A summary field comes back into the projects' Summary: too many to refresh in Notion now, say how.
+        if (data.mirrorsNote) toast.info(data.mirrorsNote);
       },
     });
   }
@@ -305,12 +307,14 @@ export function FieldsTab({
       queue: QUEUE.fields,
       optimistic: () => apply({ type: "patch", id: row.id, patch: { archived: true, archivedAt: new Date().toISOString() } }),
       run: (opId) => archiveProjectFieldAction(opId, row.id),
-      onSuccess: () => {
+      onSuccess: (data) => {
         toast(`Archived “${row.label}”`, {
           duration: 8000,
           description: "Values in projects are kept and come back if you restore it.",
           action: { label: "Undo", onClick: () => restore(row) },
         });
+        // A summary field leaves the projects' Summary: too many to refresh in Notion now, say how.
+        if (data.mirrorsNote) toast.info(data.mirrorsNote);
       },
     });
   }

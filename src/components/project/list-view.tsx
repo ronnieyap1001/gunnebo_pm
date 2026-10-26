@@ -1,9 +1,10 @@
 "use client";
 
-import { useEffect, useMemo, useRef, useState } from "react";
+import { useEffect, useId, useMemo, useRef, useState } from "react";
 import { Loader2, MinusCircle, Paperclip, Pin, StickyNote, X } from "lucide-react";
 import { toast } from "sonner";
 import type { Value } from "@/domain/types";
+import { parsePercentInput } from "@/domain/values";
 import { cn } from "@/lib/utils";
 import { Button } from "@/components/ui/button";
 import { Checkbox } from "@/components/ui/checkbox";
@@ -13,6 +14,7 @@ import { Progress } from "@/components/ui/progress";
 import { Switch } from "@/components/ui/switch";
 import { StateBadge } from "@/components/state/state-badge";
 import { ValueEditor } from "@/components/fields/value-editor";
+import { hintedBy, InputHint, PERCENT_HINT } from "@/components/fields/input-hint";
 import { EmptyState } from "@/components/common/empty-state";
 import { useProject } from "./context";
 import { useProjectHotkeys } from "./use-project-hotkeys";
@@ -65,18 +67,25 @@ function inlineText(s: StepView): string {
   return "";
 }
 
-/** Parses the inline input; `undefined` = not valid (keep editing). */
-function parseInline(s: StepView, text: string): Value | null | undefined {
+/**
+ * Parses the inline input; `undefined` = not valid (keep editing). A percent is read as in the side panel ("7,5" is a
+ * decimal comma and saves 8); a number reads commas as thousands separators ("1,200").
+ */
+export function parseInline(s: Pick<StepView, "fieldType">, text: string): Value | null | undefined {
   const t = text.trim();
   if (!t) return null;
   if (s.fieldType === "TEXT") return { text: t };
-  const n = Number(t.replace(/,/g, "").replace(/%$/, "").trim());
-  if (!Number.isFinite(n)) return undefined;
   if (s.fieldType === "PERCENT") {
-    if (n < 0 || n > 100) return undefined;
-    return { percent: Math.round(n) };
+    const p = parsePercentInput(t);
+    return p === null ? undefined : { percent: p };
   }
-  return { number: n };
+  const n = Number(t.replace(/,/g, "").replace(/%$/, "").trim());
+  return Number.isFinite(n) ? { number: n } : undefined;
+}
+
+/** Why the inline input was not saved. */
+function inlineHint(s: Pick<StepView, "fieldType">): string {
+  return s.fieldType === "PERCENT" ? PERCENT_HINT : "Enter a number, for example 12 or 4.5.";
 }
 
 export function ListView({ hotkeysEnabled }: { hotkeysEnabled: boolean }) {
@@ -580,6 +589,7 @@ function ValueCell({
 function InlineInput({ s, onDone, onTabNext, onCommit }: { s: StepView; onDone: () => void; onTabNext: () => void; onCommit: (v: Value | null) => void }) {
   const [text, setText] = useState(inlineText(s));
   const [invalid, setInvalid] = useState(false);
+  const hintId = useId();
   const done = useRef(false);
 
   function commit(): boolean {
@@ -602,9 +612,9 @@ function InlineInput({ s, onDone, onTabNext, onCommit }: { s: StepView; onDone: 
           setText(e.target.value);
           setInvalid(false);
         }}
-        aria-invalid={invalid || undefined}
+        {...hintedBy(hintId, invalid)}
         aria-label={`${s.name} value`}
-        title={invalid ? (s.fieldType === "PERCENT" ? "Enter a whole number from 0 to 100" : "Enter a number") : undefined}
+        title={invalid ? inlineHint(s) : undefined}
         onKeyDown={(e) => {
           if (e.key === "Enter") {
             e.preventDefault();
@@ -628,14 +638,18 @@ function InlineInput({ s, onDone, onTabNext, onCommit }: { s: StepView; onDone: 
         onBlur={() => {
           if (done.current) return;
           if (!commit()) {
-            toast.error(`"${text.trim()}" was not saved`, {
-              description: s.fieldType === "PERCENT" ? "Enter a whole number from 0 to 100." : "Enter a number, for example 12 or 4.5.",
-            });
+            toast.error(`"${text.trim()}" was not saved`, { description: inlineHint(s) });
           }
           onDone();
         }}
         className="h-6 px-1.5 text-sm tabular-nums"
       />
+      {/* The cell has no room for the hint: sighted users get the red ring and the tooltip, screen readers this. */}
+      {invalid ? (
+        <InputHint id={hintId} className="sr-only">
+          {inlineHint(s)}
+        </InputHint>
+      ) : null}
       {s.fieldType === "PERCENT" ? <span className="text-xs text-muted-foreground">%</span> : null}
       {s.fieldType === "NUMBER" && s.config.unit ? <span className="text-xs text-muted-foreground">{s.config.unit}</span> : null}
     </div>

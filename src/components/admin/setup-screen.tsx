@@ -23,7 +23,7 @@ import {
 import { callAction, toastError } from "./call";
 import { when } from "./format";
 import { Notice } from "./notice";
-import { currentSetupStep, setupStepState } from "./setup-steps";
+import { checkAgainToast, checkUntilSeeded, currentSetupStep, setupStepState } from "./setup-steps";
 import { useJob } from "./use-job";
 
 export const README_SETUP_URL = "https://github.com/ronnieyap1001/gunnebo_pm#one-time-setup-about-15-minutes";
@@ -67,6 +67,7 @@ export function SetupScreen({
   const [status, setStatus] = useState(initial);
   const [checking, setChecking] = useState(false);
   const [startingSeed, setStartingSeed] = useState(false);
+  const [confirmingSeed, setConfirmingSeed] = useState(false);
   const starting = useRef(false);
   const job = useJob();
   const resumed = useRef(false);
@@ -93,11 +94,20 @@ export function SetupScreen({
     setStatus(r.data);
     router.refresh();
     if (!opts.quiet) {
-      const next = currentStep(r.data);
-      if (next === currentStep(status)) toast.info(next === "ready" ? "Everything is set up." : "Nothing has changed yet.");
-      else toast.success("Thanks, that worked.");
+      const { tone, text } = checkAgainToast(currentStep(status), currentStep(r.data));
+      toast[tone](text);
     }
     return r.data;
+  }
+
+  /** After the seed: checks a few more times before showing step 4 again (see checkUntilSeeded). */
+  async function checkAfterSeed() {
+    setConfirmingSeed(true);
+    try {
+      await checkUntilSeeded(() => checkAgain({ quiet: true }));
+    } finally {
+      setConfirmingSeed(false);
+    }
   }
 
   async function createDatabases() {
@@ -116,7 +126,7 @@ export function SetupScreen({
   }
 
   async function runImport(opId: string, title: string, done: string): Promise<boolean> {
-    const r = await job.run(title, () => continueImportAction(opId), { resume: { jobId: opId, kind: "import" } });
+    const r = await job.run(title, (driver) => continueImportAction(opId, driver), { resume: { jobId: opId, kind: "import" } });
     if (!r.ok) {
       // The job is saved in Notion: Retry carries on where it stopped (same opId).
       toastError(r, "Loading stopped", {
@@ -131,7 +141,7 @@ export function SetupScreen({
 
   async function loadMilestones() {
     if (seedJob) {
-      if (await runImport(seedJob.opId, "Loading the 64 milestones", "The 64 milestones are loaded.")) await checkAgain({ quiet: true });
+      if (await runImport(seedJob.opId, "Loading the 64 milestones", "The 64 milestones are loaded.")) await checkAfterSeed();
       return;
     }
     // Starting takes a round trip before the progress dialog opens: a double click must not start a second load.
@@ -146,7 +156,7 @@ export function SetupScreen({
         await checkAgain({ quiet: true });
         return;
       }
-      if (await runImport(opId, "Loading the 64 milestones", "The 64 milestones are loaded.")) await checkAgain({ quiet: true });
+      if (await runImport(opId, "Loading the 64 milestones", "The 64 milestones are loaded.")) await checkAfterSeed();
     } finally {
       starting.current = false;
       setStartingSeed(false);
@@ -161,8 +171,8 @@ export function SetupScreen({
     if (j.kind === "createProject" || j.kind === "sync") {
       const action = j.kind === "sync" ? continueSyncAction : continueCreateProjectAction;
       let projectId = j.projectId ?? "";
-      const step = async (): Promise<ActionResult<JobProgress>> => {
-        const once = () => action(j.opId);
+      const step = async (driver: string): Promise<ActionResult<JobProgress>> => {
+        const once = () => action(j.opId, driver);
         const r = projectId ? await enqueue(projectId, once) : await once();
         if (r.ok && r.data.projectId) projectId = r.data.projectId;
         return r;
@@ -190,7 +200,13 @@ export function SetupScreen({
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);
 
-  const busy = job.running || checking || startingSeed;
+  // Unfinished tasks another tab or window is running right now (it holds the job's lease): not interrupted. Read on
+  // the client after the page shows, since it compares a time.
+  const [clientNow, setClientNow] = useState<number | null>(null);
+  useEffect(() => setClientNow(Date.now()), [status]);
+  const runningElsewhere = (j: OpenJob) => clientNow !== null && !!j.leaseUntil && Date.parse(j.leaseUntil) > clientNow;
+
+  const busy = job.running || checking || startingSeed || confirmingSeed;
   // Some databases exist but not all of them are complete: say "repair", not "create".
   const incomplete = status.databases.filter((d) => !d.ok);
   const needsRepair = incomplete.length > 0 && incomplete.length < status.databases.length;
@@ -208,9 +224,7 @@ export function SetupScreen({
         <ModeBadge mode={status.mode} tokenRejected={status.errorKind === "tokenRejected"} />
       </div>
 
-      {step === "ready" ? (
-        <ReadyCard status={status} />
-      ) : null}
+      {step === "ready" ? <ReadyCard status={status} checkButton={checkButton} /> : null}
 
       {step === "busy" ? (
         <Notice tone="warning" title="Notion is busy, try again" action={checkButton}>
@@ -385,7 +399,10 @@ export function SetupScreen({
       {otherJobs.length ? (
         <section aria-labelledby="open-jobs" className="space-y-2">
           <h2 id="open-jobs" className="text-sm font-semibold">Unfinished tasks</h2>
-          <p className="text-xs text-muted-foreground">These stopped part-way, for example because a tab was closed. Resuming never repeats work.</p>
+          <p className="text-xs text-muted-foreground">
+            These stopped part-way, for example because a tab was closed, or are still running in another tab or window. Resuming never
+            repeats work; while another tab or window runs a task, Resume waits for it.
+          </p>
           <ul className="divide-y rounded-lg border bg-card">
             {otherJobs.map((j) => (
               <li key={j.opId} className="flex items-center gap-3 px-3 py-2 text-sm">
@@ -396,11 +413,12 @@ export function SetupScreen({
                   </p>
                   <p className="text-xs text-muted-foreground tabular-nums">
                     {j.doneCount} of {j.total} done · started {when(j.createdAt, timeZone)}
+                    {runningElsewhere(j) ? " · running in another tab or window" : ""}
                   </p>
                 </div>
                 <Button size="sm" variant="outline" onClick={() => void resume(j)} disabled={busy || !status.schemaReady}>
                   <Play aria-hidden />
-                  Resume
+                  {runningElsewhere(j) ? "Follow here" : "Resume"}
                 </Button>
               </li>
             ))}
@@ -430,7 +448,8 @@ export function SetupScreen({
   );
 }
 
-function ReadyCard({ status }: { status: SetupStatusDTO }) {
+/** "Check again" stays available: something changed in Notion since (a database moved to the trash) shows up here. */
+function ReadyCard({ status, checkButton }: { status: SetupStatusDTO; checkButton: React.ReactNode }) {
   return (
     <div className="state-d flex flex-col items-start gap-3 rounded-xl border border-[var(--s-border)] bg-[var(--s-bg)] p-5 sm:flex-row sm:items-center">
       <CircleCheck className="size-8 shrink-0 text-[var(--s-solid)]" aria-hidden />
@@ -438,15 +457,18 @@ function ReadyCard({ status }: { status: SetupStatusDTO }) {
         <h2 className="text-base font-semibold">Everything is set up</h2>
         <p className="text-sm text-foreground/80">
           Notion is connected{status.parentPage ? ` (page “${status.parentPage.title}”)` : ""}, the databases exist and the milestones are
-          loaded.
+          loaded. If a page still says something is missing, click <strong>Check again</strong>.
         </p>
       </div>
-      <Button asChild size="lg" className="h-10 px-5 text-sm">
-        <Link href="/portfolio">
-          Open Portfolio
-          <ArrowRight aria-hidden />
-        </Link>
-      </Button>
+      <div className="flex flex-wrap items-center gap-2">
+        {checkButton}
+        <Button asChild size="lg" className="h-10 px-5 text-sm">
+          <Link href="/portfolio">
+            Open Portfolio
+            <ArrowRight aria-hidden />
+          </Link>
+        </Button>
+      </div>
     </div>
   );
 }

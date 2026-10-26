@@ -23,28 +23,41 @@ import type { Repo, StepInput, StoredStep } from "@/server/repo/types";
 import { appendHistory, AppError, EV, newId, summaryFor, type Ctx } from "./context";
 import { hasChoices } from "./definitions";
 import {
+  assertJobFits,
   BATCH_SIZE,
+  beginJobCall,
+  claimJob,
+  elsewhereResult,
   finishJob,
   isFinished,
   loadJob,
   loadJobForContinue,
+  mergeRecord,
   newJob,
+  orphansOf,
+  recheckJob,
+  SAMPLE_ID,
+  SAMPLE_LEASE,
+  sameRecord,
   saveJob,
+  saveRunningJob,
   settleSome,
   stepResult,
   type JobBase,
   type JobStepResult,
+  type SaveOutcome,
 } from "./jobs";
 import { getTemplate } from "./library";
 import { attachmentCounts, buildCells, currentMirror, progressOfCells, stepMirrorsOf, stepState, valueSnapshot } from "./mirrors";
 import {
   countsTrustingRecentCells,
-  discardSteps,
-  findStepCopies,
-  keyedIds,
+  discardUnusedCopies,
+  referencedStepIds,
   requireProject,
   settleAll,
+  stepCopies,
   stepKeyOf,
+  untouched,
   withKnownSteps,
 } from "./projects";
 
@@ -94,14 +107,18 @@ export function decoratePlan(
 }
 
 async function loadInput(repo: Repo, projectId: string) {
-  const [project, listed, attachments, template] = await Promise.all([
+  const [project, listed, attachments, notes, template] = await Promise.all([
     requireProject(repo, projectId),
     repo.steps.listByProject(projectId, { includeArchived: true }),
     repo.attachments.listByProject(projectId),
+    repo.notes.listByProject(projectId),
     getTemplate(repo),
   ]);
   // A step created moments ago may not be in the query yet: without it the plan would add its milestone again.
-  const steps = await withKnownSteps(repo, project, listed);
+  // Untouched second copies of a step (a retried create) are left out, as on the project page.
+  const known = await withKnownSteps(repo, project, listed);
+  const { leaveOut } = stepCopies(project, known, referencedStepIds(project, attachments, notes));
+  const steps = known.filter((s) => !leaveOut.has(s.id));
   return { project, steps, counts: attachmentCounts(attachments), template };
 }
 
@@ -279,7 +296,17 @@ export async function startSync(ctx: Ctx, input: StartSyncInput): Promise<{ tota
     itemStepIds,
     before,
   };
-  await saveJob(ctx.repo, job);
+  // The job grows as it records the steps it adds and patches: refuse up front a sync that could not be saved to the end.
+  assertJobFits(
+    {
+      ...job,
+      createdStepIds: Object.fromEntries(result.newSteps.map((d) => [d.tempId, SAMPLE_ID])),
+      patchedStepIds: result.stepPatches.map(() => SAMPLE_ID),
+      lease: SAMPLE_LEASE,
+    } as SyncJob,
+    "This sync",
+  );
+  await saveJob(ctx.repo, job, { creates: true });
   return { total };
 }
 
@@ -303,13 +330,21 @@ export interface SyncProgress extends JobStepResult {
  * remapped flow, cells rebuilt from fresh steps, templateRevision, unticked items merged into syncDismissed, second
  * copies moved to Notion's trash, ONE History row `project.synced`, job cleared. The job is saved after every
  * batch. Steps a lagging query does not show yet are read by id.
+ *
+ * `driver` identifies the browser run (see claimJob): while another run holds the job, the call only reports
+ * RUNNING_ELSEWHERE. Finalizing works from the record Notion has; a new step already in the project's flow (another
+ * call finalized first) or one someone added a value, file, link or note to is kept instead of the recorded copy,
+ * and a copy is only discarded when nothing uses it.
  */
-export async function continueSync(ctx: Ctx, opId: string): Promise<SyncProgress> {
-  const job = await loadJobForContinue<SyncJob>(ctx.repo, opId);
-  if (!job || job.kind !== "sync") throw new AppError("NOT_FOUND", "This sync was not found. Open the preview again.");
-  if (isFinished(job)) {
-    return { ...stepResult(true, job.total, job.total, "Sync finished"), projectId: job.projectId ?? "" };
-  }
+export async function continueSync(ctx: Ctx, opId: string, opts: { driver?: string } = {}): Promise<SyncProgress> {
+  const call = beginJobCall(ctx, opts.driver);
+  const loaded = await loadJobForContinue<SyncJob>(ctx.repo, opId);
+  if (!loaded || loaded.kind !== "sync") throw new AppError("NOT_FOUND", "This sync was not found. Open the preview again.");
+  const claim = await claimJob(call, loaded);
+  if (claim.wait) return { ...claim.wait, projectId: loaded.projectId ?? "" };
+  const job = claim.job;
+  const finished = (): SyncProgress => ({ ...stepResult(true, job.total, job.total, "Sync finished"), projectId: job.projectId ?? "" });
+  if (isFinished(job)) return finished();
   const projectId = job.projectId;
   const { result } = job;
   const total = job.total;
@@ -334,10 +369,12 @@ export async function continueSync(ctx: Ctx, opId: string): Promise<SyncProgress
   read.forEach((s) => {
     if (s && s.projectId === projectId) byId.set(s.id, s);
   });
+  const gone = new Set<string>();
   for (const [tempId, id] of Object.entries(created)) {
     if (byId.has(id)) continue;
     // A recorded step is gone (deleted in Notion meanwhile): forget it, so it is created again.
     delete created[tempId];
+    gone.add(id);
     dirty = true;
   }
   let budget = BATCH_SIZE;
@@ -352,10 +389,12 @@ export async function continueSync(ctx: Ctx, opId: string): Promise<SyncProgress
       return ctx.repo.steps.create(input);
     }),
   );
+  const madeHere = new Set<string>();
   made.results.forEach((s, i) => {
     if (!s) return;
     created[createBatch[i].tempId] = s.id;
     byId.set(s.id, s);
+    madeHere.add(s.id);
     dirty = true;
   });
   const error = made.error;
@@ -365,17 +404,38 @@ export async function continueSync(ctx: Ctx, opId: string): Promise<SyncProgress
   const doneSoFar = () =>
     result.newSteps.filter((d) => created[d.tempId]).length + result.stepPatches.filter((p) => isPatched(p.stepId)).length;
   const createsLeft = toCreate.length > createBatch.length;
-  const saveProgress = async () => {
+  const saveProgress = async (): Promise<SaveOutcome> => {
     // Remember what was created and patched, so a later batch never creates a step twice and a later user edit of
     // a patched step (new lastOp) never gets the patch again, also when the finalize below is interrupted and resumed.
+    // What another call recorded meanwhile is kept (see saveRunningJob); a copy of ours nothing uses goes to the trash
+    // (see orphansOf).
+    const lost: string[] = [];
     job.createdStepIds = created;
     job.patchedStepIds = [...applied];
     job.doneCount = doneSoFar();
     job.updatedAt = ctx.now;
-    await saveJob(ctx.repo, job);
+    const { outcome, stored } = await saveRunningJob(call, job, (st) => {
+      lost.push(...mergeRecord(created, st.createdStepIds, gone));
+      for (const id of st.patchedStepIds ?? []) applied.add(id);
+      job.patchedStepIds = [...applied];
+      job.doneCount = doneSoFar();
+    });
+    if (outcome === "elsewhere" && stored) job.lease = stored.lease;
+    const orphans = orphansOf(outcome, lost, madeHere);
+    if (orphans.length) {
+      const keep = new Set(Object.values(outcome === "saved" ? created : (stored?.createdStepIds ?? {})));
+      await discardUnusedCopies(ctx, projectId, orphans, keep);
+    }
+    madeHere.clear();
+    return outcome;
   };
+  const stopped = (outcome: SaveOutcome): SyncProgress =>
+    outcome === "finished" ? finished() : { ...elsewhereResult(job, job.lease!, call.now()), projectId };
   if (error || createsLeft) {
-    if (dirty) await saveProgress();
+    if (dirty) {
+      const outcome = await saveProgress();
+      if (outcome !== "saved" && !error) return stopped(outcome);
+    }
     if (error) throw error;
     return { ...stepResult(false, doneSoFar(), total, `Adding milestones (${doneSoFar()} of ${total})`), projectId };
   }
@@ -408,27 +468,50 @@ export async function continueSync(ctx: Ctx, opId: string): Promise<SyncProgress
     applied.add(s.id);
     dirty = true;
   }
-  if (dirty) await saveProgress();
+  if (dirty) {
+    const outcome = await saveProgress();
+    if (outcome !== "saved" && !patched.error) return stopped(outcome);
+  }
   if (patched.error) throw patched.error;
   if (pending.length > patchBatch.length) {
     return { ...stepResult(false, doneSoFar(), total, `Updating milestones (${doneSoFar()} of ${total})`), projectId };
   }
 
-  // 3. Finalize.
+  // 3. Finalize, from the record Notion has (when another call saved a different one, the next call goes on from it).
+  const progressNow = (): SyncProgress => ({
+    ...stepResult(false, doneSoFar(), total, `Updating milestones (${doneSoFar()} of ${total})`),
+    projectId,
+  });
+  const sameAsStored = (j: SyncJob) => sameRecord(j.createdStepIds, created);
+  const before = await recheckJob<SyncJob>(call, opId, sameAsStored);
+  if (before !== "same") return before === "finished" ? finished() : before === "changed" ? progressNow() : { ...before, projectId };
+  // A save keeps the new steps another call of this job recorded (see saveProgress), which this call has not read yet
+  // (the query may not show them): read them by id. One that is gone meanwhile is not finalized with; the next call
+  // forgets it and creates it again.
+  const taken = [...new Set(Object.values(created))].filter((id) => !byId.has(id));
+  (await settleAll(taken.map((id) => () => ctx.repo.steps.get(id)))).forEach((s) => {
+    if (s && s.projectId === projectId) byId.set(s.id, s);
+  });
+  if (taken.some((id) => !byId.has(id))) return progressNow();
   const project = await requireProject(ctx.repo, projectId);
-  const idMap: Record<string, string> = {};
-  for (const d of result.newSteps) if (created[d.tempId] && byId.has(created[d.tempId])) idMap[d.tempId] = created[d.tempId];
+  const notes = await ctx.repo.notes.listByProject(projectId);
+  // Every step of the project: what the query showed, what this job created or patched, and (read by id) steps the
+  // cells or the flow know that the query does not show yet.
+  const known = await withKnownSteps(ctx.repo, project, [...byId.values()], Object.keys(project.flow?.nodes ?? {}));
+  const referenced = referencedStepIds(project, attachments, notes);
+  const idMap = keptNewSteps(projectId, result.newSteps, created, known, project, referenced);
   // The planned flow as is when the project flow is still the one the plan was made from; otherwise only the plan's
   // changes, applied onto the flow as it is now (positions moved and arrows drawn meanwhile are kept).
   const flow =
     !job.flowDelta || !job.baseFlowHash || flowHash(project.flow) === job.baseFlowHash
       ? remapFlow(result.flow, idMap)
       : applyFlowDelta(project.flow, job.flowDelta, idMap);
-  // Every step of the project: what the query showed, what this job created or patched, and (read by id) steps the
-  // cells know that the query does not show yet; not the second copies a crashed batch may have left.
-  const copies = findStepCopies(all, keyedIds(projectId, created), job.opId);
+  // Not the second copies of a new step: they stay out of the cells (and go to the trash below when nothing uses them).
+  const newKeys = new Set(result.newSteps.map((d) => stepKeyOf(projectId, d.tempId)));
+  const kept = new Set(Object.values(idMap));
+  const copies = known.filter((s) => newKeys.has(s.stepKey) && !kept.has(s.id) && untouched(s, referenced) && !s.archived);
   const copyIds = new Set(copies.map((s) => s.id));
-  const steps: StoredStep[] = (await withKnownSteps(ctx.repo, project, [...byId.values()])).filter((s) => !copyIds.has(s.id));
+  const steps: StoredStep[] = known.filter((s) => !copyIds.has(s.id));
   const cells = buildCells(steps, countsTrustingRecentCells(ctx, project, attachments));
   const progress = progressOfCells(cells, ctx.day).pct;
   const dismissed = { ...(project.syncDismissed ?? {}) };
@@ -443,7 +526,10 @@ export async function continueSync(ctx: Ctx, opId: string): Promise<SyncProgress
     mirrors: { current: currentMirror(cells, flow, ctx.day) },
   });
   // Second copies go first: the History row is the last write before the tombstone (see continueImport).
-  await discardSteps(ctx, copies);
+  const after = await recheckJob<SyncJob>(call, opId, sameAsStored);
+  if (after === "finished") return finished();
+  if (after !== "same") return after === "changed" ? progressNow() : { ...after, projectId };
+  await discardUnusedCopies(ctx, projectId, [...copyIds], kept);
 
   const n = result.appliedItemIds.length;
   const declined = Object.keys(job.unselected);
@@ -480,6 +566,42 @@ export async function continueSync(ctx: Ctx, opId: string): Promise<SyncProgress
   }
   await finishJob(ctx, job, { projectId, appliedItemIds: result.appliedItemIds });
   return { ...stepResult(true, total, total, "Sync finished"), projectId, appliedItemIds: result.appliedItemIds };
+}
+
+/**
+ * tempId → the step the project keeps for each new step of a sync: the copy already in the project's flow (another
+ * call of this job finalized first), else a copy someone changed or added a file, link or note to while the recorded
+ * one is untouched (their work stays in the flow), else the recorded copy (also when someone archived it meanwhile).
+ */
+export function keptNewSteps(
+  projectId: string,
+  newSteps: { tempId: string }[],
+  created: Record<string, string>,
+  known: StoredStep[],
+  project: Project,
+  referenced: ReadonlySet<string>,
+): Record<string, string> {
+  const inFlow = (id: string) => Object.prototype.hasOwnProperty.call(project.flow?.nodes ?? {}, id);
+  const knownIds = new Set(known.map((s) => s.id));
+  const byKey = new Map<string, StoredStep[]>();
+  for (const s of known) {
+    if (s.archived) continue;
+    const group = byKey.get(s.stepKey) ?? [];
+    group.push(s);
+    byKey.set(s.stepKey, group);
+  }
+  const idMap: Record<string, string> = {};
+  for (const d of newSteps) {
+    const group = byKey.get(stepKeyOf(projectId, d.tempId)) ?? [];
+    const recorded = group.find((s) => s.id === created[d.tempId]);
+    const placed = group.find((s) => inFlow(s.id));
+    const recordedUntouched = !!recorded && untouched(recorded, referenced);
+    const touched = recordedUntouched ? group.find((s) => s !== recorded && !untouched(s, referenced)) : undefined;
+    const keep = placed ?? touched ?? recorded;
+    if (keep) idMap[d.tempId] = keep.id;
+    else if (knownIds.has(created[d.tempId])) idMap[d.tempId] = created[d.tempId];
+  }
+  return idMap;
 }
 
 export interface SyncTarget {

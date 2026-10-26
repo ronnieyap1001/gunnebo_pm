@@ -29,7 +29,7 @@ import { isEmptyValue } from "@/domain/values";
 import type { Repo, StoredStep } from "@/server/repo/types";
 import { attachmentCounts, cellFlowOrder, currentOfCells, defOf, progressOfCells, stepState, type ProgressInfo } from "@/server/services/mirrors";
 import { PROJECT_CLOSED_KEY } from "@/server/services/steps";
-import { PROJECT_STATUS_LABELS, withKnownSteps } from "@/server/services/projects";
+import { PROJECT_STATUS_LABELS, referencedStepIds, stepCopies, withKnownSteps } from "@/server/services/projects";
 import { decoratePlan } from "@/server/services/sync";
 import {
   attachmentDTO,
@@ -370,7 +370,11 @@ export async function getProjectPageData(repo: Repo, day: DayContext, id: string
     templateOf(repo, deps),
   ]);
   // Notion's query can lag a few seconds behind a write: read a just-added step by id so it shows straight away.
-  const steps = await withKnownSteps(repo, project, listed);
+  const known = await withKnownSteps(repo, project, listed);
+  // An untouched second copy of a step (a create retried while the query did not show the first one) is not shown:
+  // the project keeps one copy, and reconcile moves the other to Notion's trash.
+  const { leaveOut } = stepCopies(project, known, referencedStepIds(project, attachments, notes));
+  const steps = known.filter((s) => !leaveOut.has(s.id));
   return buildProjectPage({ project, steps, notes, attachments, fields, template, day });
 }
 

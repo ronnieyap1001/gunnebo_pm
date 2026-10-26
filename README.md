@@ -119,7 +119,7 @@ Press **?** anywhere to see keyboard shortcuts. **Ctrl+K** (or **⌘K** on a Mac
 |---|---|
 | "Gunnebo PM needs one more setting" | Add the missing variable in Vercel (Settings → Environment Variables), then **Deployments → ⋯ → Redeploy** |
 | Setup says the Notion page isn't connected | In Notion, open **Gunnebo PM**, **••• → Connections**, add **Gunnebo PM app**, then click **Check again** |
-| "Notion is busy" or "Notion didn't answer in time" | Wait a minute and click **Try again**. Long jobs resume by themselves |
+| "Notion is busy" or "Notion may be busy" | Wait a minute and click **Try again**. Long jobs resume by themselves |
 | "Too many wrong passwords" | Wait 15 minutes, then sign in again |
 | You forgot the password | Change `APP_PASSWORD` in Vercel and redeploy |
 | You lost a laptop or phone that was signed in | **Settings → Sign out everywhere**. To be completely sure, also change `APP_PASSWORD` and redeploy |

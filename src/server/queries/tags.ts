@@ -7,7 +7,8 @@ import "server-only";
  * - projectFields: project field definitions.
  * - settings: time zone, display name, backup time, seed marker.
  * - schema: the Notion schema registry (database and property ids), shared by all server instances. Setup, "Check
- *   again", "Reload from Notion" and "Start over" refresh it; the repo also drops it when it meets a stale id.
+ *   again", "Reload from Notion" and "Start over" refresh it; the repo also drops it when it meets a stale id or finds
+ *   it out of date (while a page renders, right after the response).
  * Projects, steps, notes, attachments and History are never cached.
  */
 export const TAGS = {

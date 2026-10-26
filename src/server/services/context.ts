@@ -52,7 +52,8 @@ export type AppErrorCode =
   | "BUSY"
   | "BLOCK_LIMIT"
   | "STALE_PLAN"
-  | "FORBIDDEN";
+  | "FORBIDDEN"
+  | "TOO_LARGE";
 
 /** An error the user can understand (and usually fix). `message` is plain English and safe to show. */
 export class AppError extends Error {

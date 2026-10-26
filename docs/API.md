@@ -33,11 +33,11 @@ Every service takes `ctx` first and throws `AppError(code, message, details?)`.
 - `createProjectField(ctx, {label, fieldType, choices?, config?, showInSummary?})`
 - `updateProjectField(ctx, id, {label?, fieldType?, choices?, config?, showInSummary?, order?}) → ProjectField & {mirrorsUpdated?, mirrorsNote?}`. A blocked type change throws VALIDATION with `details.blocking`. When the change alters the Notion Customer / Project type / Summary mirrors, up to 30 affected projects are rewritten; beyond that `mirrorsNote` says to run Repair mirrors.
 - `addProjectFieldChoice(ctx, fieldId, label) → {field, choiceId}`
-- `archiveProjectField(ctx, id)` (FORBIDDEN for system fields), `restoreProjectField(ctx, id)` (VALIDATION when an active field already has its name)
+- `archiveProjectField(ctx, id) → {mirrorsUpdated?, mirrorsNote?}` (FORBIDDEN for system fields), `restoreProjectField(ctx, id) → {mirrorsUpdated?, mirrorsNote?}` (VALIDATION when an active field already has its name). Both refresh the Notion Summary mirrors when the field shows in the summary, with the same 30-project limit as `updateProjectField`.
 
 **Projects**
 - `startCreateProject(ctx, {code, name, status?, details?}) → {projectId, total}`
-- `continueCreateProject(ctx, opId) → {done, message, fraction, total, doneCount, projectId, created}`
+- `continueCreateProject(ctx, opId, {driver?}?) → {done, message, fraction, total, doneCount, projectId, created}`
 - `updateProject(ctx, id, {code?, name?, status?, details?}) → {project, changes}`
 - `archiveProject(ctx, id)`, `restoreProject(ctx, id)`, `reconcileProject(ctx, projectId, {rewriteMirrors?}?) → {changed}`
 
@@ -49,14 +49,14 @@ Every service takes `ctx` first and throws `AppError(code, message, details?)`.
 **Sync**
 - `previewSync(ctx, projectId) → {projectId, items: (SyncItem & {dismissed})[], warnings, templateRevision, projectRevision, pendingCount}`
 - `startSync(ctx, {projectId, selectedIds, dismissUnselected? = true}) → {total}`
-- `continueSync(ctx, opId) → JobStepResult & {projectId, appliedItemIds?}`
+- `continueSync(ctx, opId, {driver?}?) → JobStepResult & {projectId, appliedItemIds?}`
 - `startSyncDefaults(ctx, projectId) → {total, itemCount}`, `listSyncTargets(repo)`
 
 **Template file**
 - `exportTemplate(repo, exportedAt?)`
 - `previewImport(ctx, json, {reason?}?) → summary`
 - `startImport(ctx, json, {reason: 'import' | 'seed' | 'reset'}) → {total, summary}`
-- `startSeed(ctx)`, `startResetTemplate(ctx)`, `continueImport(ctx, opId) → JobStepResult`
+- `startSeed(ctx)`, `startResetTemplate(ctx)`, `continueImport(ctx, opId, {driver?}?) → JobStepResult`
 
 **Settings and maintenance**
 - `getAppSettings(repo)`, `setTimeZone(ctx, tz)`, `setDisplayName(ctx, name)`, `recordBackup(ctx) → Iso`
@@ -67,6 +67,7 @@ Every service takes `ctx` first and throws `AppError(code, message, details?)`.
 
 **Jobs and context**
 - `listOpenJobs(repo)`, `getJobStatus(repo, opId)`
+- One driver at a time: a `continue…` call with a `driver` id (stable for one browser run, see `src/lib/run-job.ts`) takes a lease in the job row (30 s, renewed by every save for twice as long as the call took, at most 5 min). Another driver gets `{done: false, code: 'RUNNING_ELSEWHERE', retryInMs}` with the message "Running in another tab or window, waiting…"; runJob keeps waiting while the lease is renewed and takes over when it runs out. Calls without a driver take no lease (tests and scripts only).
 - `makeCtx(repo, {actor?, opId?, source?, now?, timeZone?, today?, correlationId?, externalRef?})`, `makeCtxFromSettings(repo, opts)`, `isAppError(err)`
 
 **Queries** (`@/server/queries`; only `cached.ts` imports `next/*`)
@@ -86,6 +87,8 @@ What changed for the UI: none of the signatures above changed. The batch id retu
 - **The browser must retry with the same opId.** With History written first, a failed action that is never retried leaves a row for a change that didn't land. The UI's write queue must retry failed writes with the original opId.
 - **Server Actions must catch `AppError`.** In production, Next masks errors thrown from Server Actions, so the actions need to catch it and return `{code, message, details}`.
 - **Notion query lag.** Jobs (create project, sync, import) record the id of every row they create and save it after every batch, read their job row by page id, and read steps the query does not show yet by id; reconcile and attachment counts do the same. Single-action retry checks (`hasOp`, stepKey of `addProjectStep`, `findByCode`, orphan adoption) still read through Notion queries, which can lag a fresh write by a few seconds, so a very fast retry could still duplicate. A crash between a job's create and its save can leave a second copy: finalize (and, for steps, reconcile) moves untouched copies to Notion's trash once the query shows them.
+- **Leases are not compare-and-set.** Notion has no conditional write. A takeover re-reads the job row by id after LEASE_SETTLE_MS, but if the old driver saves in that window its save can be overwritten; extra copies this leaves are cleaned up by finalize or reconcile, and in a narrow race a second History row can appear. After a slow call or a takeover another tab may wait up to 5 minutes before taking over the job of a closed tab.
+- **Copies are trashed only when nothing points at them.** Finalize and reconcile move a row to Notion's trash only when the freshly read flow and job record do not use it and nobody touched it (no value, note, link or file, created by this job's opId). Step copies left by a crash are cleaned up by reconcile on the next page view.
 - **Waits under lag.** `continue…` with an opId whose job row is not visible yet retries the lookup 4 times, 2 s apart (about 8 s before NOT_FOUND). A job save that Notion answers with a 5xx, a timeout or a dropped connection is sent once more. After an import create that failed, finalize waits up to 10 s (at most 8 waiting calls) so a copy Notion did save shows in the query and goes to the trash.
 - **Step writes after a crash.** A crash between the step write and the History append still gives a `resumed` row without the old value.
 - **Orphan adoption is a heuristic.** It looks back 15 minutes and at the newest 100 History rows of that type.

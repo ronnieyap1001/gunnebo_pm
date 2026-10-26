@@ -11,7 +11,7 @@ import { Dialog, DialogContent, DialogDescription, DialogFooter, DialogHeader, D
 import { Input } from "@/components/ui/input";
 import { addProjectFieldChoiceAction, startCreateProjectAction } from "@/app/(app)/projects/actions";
 import { callAction, isRetryable } from "@/components/shell/action-call";
-import { DetailInput, parseNumberText, URL_PATTERN, type DraftText } from "./detail-inputs";
+import { DetailInput, detailTextError, type DraftText } from "./detail-inputs";
 import { onRadioKeyDown } from "./radio-keys";
 import { PROJECT_STATUS_OPTIONS } from "./status-pill";
 
@@ -118,13 +118,8 @@ export function NewProjectDialog({
     const out: Record<string, string> = {};
     for (const f of fields) {
       const t = texts[f.id];
-      if (t === undefined || !t.trim()) continue;
-      if (f.fieldType === "NUMBER" || f.fieldType === "PERCENT") {
-        const n = parseNumberText(t);
-        if (n !== undefined && !Number.isFinite(n)) out[f.id] = "Enter a number, for example 24.";
-        else if (f.fieldType === "PERCENT" && n !== undefined && (n < 0 || n > 100)) out[f.id] = "Enter 0 to 100.";
-      }
-      if (f.fieldType === "LINK" && !URL_PATTERN.test(t.trim())) out[f.id] = "Enter a web address starting with https://";
+      const error = t === undefined ? undefined : detailTextError(f, t);
+      if (error) out[f.id] = error;
     }
     return out;
   }, [fields, texts]);
@@ -407,12 +402,13 @@ function FormRow({
         {required ? <span className="sr-only"> (required)</span> : null}
       </label>
       {children}
+      {/* The input points at this line (aria-describedby); role="alert" announces an error as soon as it appears. */}
       {error ? (
-        <p id={`${htmlFor}-msg`} className="text-xs text-destructive">
+        <p key="error" id={`${htmlFor}-msg`} role="alert" className="text-xs text-destructive">
           {error}
         </p>
       ) : hint ? (
-        <p id={`${htmlFor}-msg`} className="text-xs text-muted-foreground">
+        <p key="hint" id={`${htmlFor}-msg`} className="text-xs text-muted-foreground">
           {hint}
         </p>
       ) : null}

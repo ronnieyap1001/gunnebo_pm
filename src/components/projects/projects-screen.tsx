@@ -216,12 +216,19 @@ export function ProjectsScreen({ rows, takenCodes, columns, formFields, mileston
               className="state-w flex flex-wrap items-center gap-x-3 gap-y-1 rounded-md border border-[var(--s-border)] bg-[var(--s-bg)] px-3 py-1.5 text-sm text-[var(--s-fg)]"
             >
               <CirclePause className="size-4 shrink-0" aria-hidden />
-              <span className="min-w-0 flex-1">
-                Creating <strong className="font-mono">{j.code}</strong> {j.name ? <>({j.name}) </> : null}was interrupted
-                {j.doneCount > 0 ? ` after ${j.doneCount} of ${j.total} milestones` : ""}. Nothing is lost: it continues where it stopped.
-              </span>
+              {j.runningElsewhere ? (
+                <span className="min-w-0 flex-1">
+                  Creating <strong className="font-mono">{j.code}</strong> {j.name ? <>({j.name}) </> : null}is running in another tab or
+                  window ({j.doneCount} of {j.total} milestones copied). You can follow it here too; nothing is copied twice.
+                </span>
+              ) : (
+                <span className="min-w-0 flex-1">
+                  Creating <strong className="font-mono">{j.code}</strong> {j.name ? <>({j.name}) </> : null}was interrupted
+                  {j.doneCount > 0 ? ` after ${j.doneCount} of ${j.total} milestones` : ""}. Nothing is lost: it continues where it stopped.
+                </span>
+              )}
               <Button size="sm" variant="outline" className="h-7" onClick={() => void runCreate(j)} disabled={creator.running}>
-                Resume creating {j.code}
+                {j.runningElsewhere ? `Follow ${j.code} here` : `Resume creating ${j.code}`}
               </Button>
             </div>
           ))}

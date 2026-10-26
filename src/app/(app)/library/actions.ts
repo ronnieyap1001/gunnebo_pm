@@ -179,25 +179,31 @@ export async function updateProjectFieldAction(
   );
 }
 
-export async function archiveProjectFieldAction(opId: string, id: unknown): Promise<ActionResult<{ id: string }>> {
+export async function archiveProjectFieldAction(
+  opId: string,
+  id: unknown,
+): Promise<ActionResult<{ id: string; mirrorsNote?: string }>> {
   return runAction(
     opId,
     async (ctx) => {
       const fieldId = parse(Id, id);
-      await archiveProjectField(ctx, fieldId);
-      return { id: fieldId };
+      const r = await archiveProjectField(ctx, fieldId);
+      return r.mirrorsNote ? { id: fieldId, mirrorsNote: r.mirrorsNote } : { id: fieldId };
     },
     FIELDS,
   );
 }
 
-export async function restoreProjectFieldAction(opId: string, id: unknown): Promise<ActionResult<{ id: string }>> {
+export async function restoreProjectFieldAction(
+  opId: string,
+  id: unknown,
+): Promise<ActionResult<{ id: string; mirrorsNote?: string }>> {
   return runAction(
     opId,
     async (ctx) => {
       const fieldId = parse(Id, id);
-      await restoreProjectField(ctx, fieldId);
-      return { id: fieldId };
+      const r = await restoreProjectField(ctx, fieldId);
+      return r.mirrorsNote ? { id: fieldId, mirrorsNote: r.mirrorsNote } : { id: fieldId };
     },
     FIELDS,
   );

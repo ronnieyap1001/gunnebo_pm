@@ -83,7 +83,7 @@ export function SyncDialog({ open, onOpenChange, resumeOpId }: { open: boolean; 
           const s = await withRetry(() => startSyncAction(opId, { projectId, selectedIds: startWith }));
           if (!s.ok) return s;
         }
-        return runJob(() => attempt(() => continueSyncAction(opId)), {
+        return runJob((driver) => attempt(() => continueSyncAction(opId, driver)), {
           onProgress: (p) => setRunning({ message: p.message, fraction: p.fraction }),
         });
       });

@@ -11,7 +11,7 @@ import { runAction, runQuery } from "@/server/actions/run";
 import { getProjectPageData, getProjectsList } from "@/server/queries";
 import { TAGS } from "@/server/queries/tags";
 import { getRepo } from "@/server/repo";
-import { listOpenJobs, loadJob } from "@/server/services/jobs";
+import { isDriverId, listOpenJobs, loadJob } from "@/server/services/jobs";
 import { addProjectFieldChoice } from "@/server/services/projectFields";
 import { continueCreateProject, startCreateProject, type CreateProgress, type CreateProjectJob } from "@/server/services/projects";
 
@@ -38,9 +38,13 @@ export async function startCreateProjectAction(opId: string, input: unknown): Pr
   return runAction(opId, (ctx) => startCreateProject(ctx, parsed.data));
 }
 
-/** One batch of the copy (up to 8 milestones). Call until `done`. */
-export async function continueCreateProjectAction(opId: string): Promise<ActionResult<CreateProgress>> {
-  return runAction(opId, (ctx) => continueCreateProject(ctx, opId));
+/**
+ * One batch of the copy (up to 8 milestones). Call until `done`. `driver` identifies the browser run (runJob): while
+ * another tab or window runs the same job, the result has code RUNNING_ELSEWHERE.
+ */
+export async function continueCreateProjectAction(opId: string, driver?: string): Promise<ActionResult<CreateProgress>> {
+  if (!isDriverId(driver)) return fail("This task's window id is not valid. Reload the page and try again.", "VALIDATION");
+  return runAction(opId, (ctx) => continueCreateProject(ctx, opId, { driver: driver ?? undefined }));
 }
 
 /** "Add 'X'" in a Dropdown or Multiple field of the New project form. Returns the new choice and the full list. */
@@ -68,9 +72,14 @@ export interface CreateJobDTO {
   doneCount: number;
   total: number;
   createdAt: string;
+  /** Another tab or window is copying it right now (it holds the job): not interrupted. */
+  runningElsewhere: boolean;
 }
 
-/** Project creations that stopped part-way (browser closed, network lost), for the "Resume creating …" banner. */
+/**
+ * Unfinished project creations, for the "Resume creating …" banner: stopped part-way (browser closed, network lost),
+ * or still running in another tab or window (`runningElsewhere`).
+ */
 export async function listCreateJobsAction(): Promise<ActionResult<CreateJobDTO[]>> {
   return runQuery(async () => {
     const repo = getRepo();
@@ -84,9 +93,10 @@ export async function listCreateJobsAction(): Promise<ActionResult<CreateJobDTO[
         projectId: j.projectId ?? null,
         code: job.code,
         name: job.name,
-        doneCount: j.doneCount,
+        doneCount: job.doneCount,
         total: j.total,
         createdAt: j.createdAt,
+        runningElsewhere: !!job.lease && Date.parse(job.lease.until) > Date.now(),
       });
     }
     return out;

@@ -230,7 +230,7 @@ export function SettingsScreen({
   }
 
   async function runReset(opId: string) {
-    const r = await job.run("Resetting the template", () => continueImportAction(opId), { resume: { jobId: opId, kind: "import" } });
+    const r = await job.run("Resetting the template", (driver) => continueImportAction(opId, driver), { resume: { jobId: opId, kind: "import" } });
     if (!r.ok) {
       // The job is saved in Notion: Retry carries on where it stopped (same opId).
       toastError(r, "The reset stopped", { retry: () => void runReset(opId) });
