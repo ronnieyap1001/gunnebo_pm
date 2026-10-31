@@ -1,0 +1,98 @@
+# Business layer API (for screens)
+
+> Generated from the services verifier report (2026-10-25). Source of truth is the code in src/server/services and src/server/queries.
+
+## Exported API
+Every service takes `ctx` first and throws `AppError(code, message, details?)`.
+
+**Steps.** Write results are `StepWriteResult = {step: StoredStep, project: {progress, cells}, changed, flagCleared?, suggestClose?}`.
+- `setStepValue(ctx, {stepId, value: unknown, expectedRev: number})`
+- `setStepNotApplicable(ctx, {stepId, notApplicable, expectedRev})`
+- `setStepFlag(ctx, {stepId, flag: NodeFlag | null, reason?, expectedRev?})`, which also returns `noteId?`
+- `confirmStepDate(ctx, stepId, expectedRev?)`
+- `bulkSetNotApplicable(ctx, {projectId, stepIds (at most 16), notApplicable}) → {changedIds, project}`
+- `addProjectStep(ctx, {projectId, name, fieldType, description?, choices?, config?, afterStepId?, position?})`
+- `updateStepDefinition(ctx, stepId, {name?, description?, fieldType?, choices?, config?}, {expectedRev?, clearValue?}?)`
+- `archiveProjectStep(ctx, stepId, {reconnect?}?) → {batchId, project}`
+- `restoreProjectBatch(ctx, projectId, batchId) → {restoredIds, skippedEdgeIds, project}`
+- `moveProjectNodes(ctx, projectId, positions)`, `addProjectEdge(ctx, projectId, from, to) → FlowEdge`, `archiveProjectEdge(ctx, projectId, edgeId)`, `layoutProject(ctx, projectId, {wrap?, viewportWidth?}?) → Flow`
+
+**Library**
+- `getTemplate(repo)`, `templateFlowOrder(template)`
+- `createMilestone(ctx, {name, fieldType, description?, choices?, config?, afterMilestoneId?, position?}) → Milestone`
+- `updateMilestone(ctx, id, {name?, description?, fieldType?, choices?, config?}) → Milestone`
+- `applyChoicesTo(ctx, sourceId, targetIds) → {updatedIds}`
+- `reorderMilestone(ctx, id, {beforeId?, afterId?}) → {milestone, effective}`
+- `archiveMilestone(ctx, id, {reconnect?}?) → {batchId, archivedEdgeIds, bridgeEdgeIds}`
+- `restoreBatch(ctx, batchId) → {restoredIds, restoredEdgeIds, skippedEdgeIds}`
+- `restoreMilestone(ctx, id) → {restoredIds, skippedEdgeIds}`
+- `moveTemplateNodes(ctx, positions)`, `addTemplateEdge(ctx, from, to) → FlowEdge`, `archiveTemplateEdge(ctx, edgeId)`, `layoutTemplate(ctx, {wrap?, viewportWidth?}?) → Flow`
+
+**Project fields**
+- `listProjectFields(repo, {includeArchived?}?)`
+- `createProjectField(ctx, {label, fieldType, choices?, config?, showInSummary?})`
+- `updateProjectField(ctx, id, {label?, fieldType?, choices?, config?, showInSummary?, order?}) → ProjectField & {mirrorsUpdated?, mirrorsNote?}`. A blocked type change throws VALIDATION with `details.blocking`. When the change alters the Notion Customer / Project type / Summary mirrors, up to 30 affected projects are rewritten; beyond that `mirrorsNote` says to run Repair mirrors.
+- `addProjectFieldChoice(ctx, fieldId, label) → {field, choiceId}`
+- `archiveProjectField(ctx, id) → {mirrorsUpdated?, mirrorsNote?}` (FORBIDDEN for system fields), `restoreProjectField(ctx, id) → {mirrorsUpdated?, mirrorsNote?}` (VALIDATION when an active field already has its name). Both refresh the Notion Summary mirrors when the field shows in the summary, with the same 30-project limit as `updateProjectField`.
+
+**Projects**
+- `startCreateProject(ctx, {code, name, status?, details?}) → {projectId, total}`
+- `continueCreateProject(ctx, opId, {driver?}?) → {done, message, fraction, total, doneCount, projectId, created}`
+- `updateProject(ctx, id, {code?, name?, status?, details?}) → {project, changes}`
+- `archiveProject(ctx, id)`, `restoreProject(ctx, id)`, `reconcileProject(ctx, projectId, {rewriteMirrors?}?) → {changed}`
+
+**Notes and attachments**
+- `addNote(ctx, {projectId, stepId?, body})`, `editNote(ctx, {projectId, noteId, body})`, `archiveNote(ctx, {projectId, noteId})`, `restoreNote(ctx, {projectId, noteId})`, all returning `Note`
+- `addLink(ctx, {projectId, stepId?, name?, url})`, `addFile(ctx, {projectId, stepId?, name, contentType, size, data: Blob})`, `archiveAttachment(ctx, id)`, `restoreAttachment(ctx, id)`, all returning `{attachment, project}`
+- `openAttachment(repo, id) → FileDownload`
+
+**Sync**
+- `previewSync(ctx, projectId) → {projectId, items: (SyncItem & {dismissed})[], warnings, templateRevision, projectRevision, pendingCount}`
+- `startSync(ctx, {projectId, selectedIds, dismissUnselected? = true}) → {total}`
+- `continueSync(ctx, opId, {driver?}?) → JobStepResult & {projectId, appliedItemIds?}`
+- `startSyncDefaults(ctx, projectId) → {total, itemCount}`, `listSyncTargets(repo)`
+
+**Template file**
+- `exportTemplate(repo, exportedAt?)`
+- `previewImport(ctx, json, {reason?}?) → summary`
+- `startImport(ctx, json, {reason: 'import' | 'seed' | 'reset'}) → {total, summary}`
+- `startSeed(ctx)`, `startResetTemplate(ctx)`, `continueImport(ctx, opId, {driver?}?) → JobStepResult`
+
+**Settings and maintenance**
+- `getAppSettings(repo)`, `setTimeZone(ctx, tz)`, `setDisplayName(ctx, name)`, `recordBackup(ctx) → Iso`
+- `exportBackupPage(admin, database, cursor)`
+- `verifyHistoryPage(ctx, cursor, limit = 100) → {checked, mismatches, unhashed, nextCursor}`
+- `listProjectIdsForRepair(repo)`, `repairMirrorsBatch(ctx, ids (at most 5)) → {checked, repaired}` (also rewrites every checked project's Notion mirrors)
+- `startOver(admin, "RESET")`
+
+**Jobs and context**
+- `listOpenJobs(repo)`, `getJobStatus(repo, opId)`
+- One driver at a time: a `continue…` call with a `driver` id (stable for one browser run, see `src/lib/run-job.ts`) takes a lease in the job row (30 s, renewed by every save for twice as long as the call took, at most 5 min). Another driver gets `{done: false, code: 'RUNNING_ELSEWHERE', retryInMs}` with the message "Running in another tab or window, waiting…"; runJob keeps waiting while the lease is renewed and takes over when it runs out. Calls without a driver take no lease (tests and scripts only).
+- `makeCtx(repo, {actor?, opId?, source?, now?, timeZone?, today?, correlationId?, externalRef?})`, `makeCtxFromSettings(repo, opts)`, `isAppError(err)`
+
+**Queries** (`@/server/queries`; only `cached.ts` imports `next/*`)
+- `getLibraryView()`, `getTemplateView()`
+- `getProjectsList({includeArchived?}?)`, `getProjectPageData(id) → ProjectPageData | null`, `scheduleReconcile(projectId)`
+- `getPortfolioData(filters?)` with filters `{status?, customer?, projectType?, q?, includeWaiting?, includeDateDriven?}`
+- `getArchiveData({projectId?}?)`, `getCellDetails(stepId)`
+- `getStepHistory(stepId, cursor?, limit?)`, `getProjectHistory(projectId, {type?, source?}?, cursor?, limit?)`, `getAllHistory(filters?, cursor?, limit?)`, `getTemplateSnapshots(cursor?)`
+- `getSetupStatus()`, `getSettingsData()`, `getDay(now?)`, `getActionCtx({opId, source?, correlationId?, externalRef?})`
+- `TAGS = {library: 'library', projectFields: 'project-fields', settings: 'settings', schema: 'schema'}` (`schema`: the Notion schema registry, shared by all server instances)
+- `getSetupStatus()` also reports `errorKind`: `'tokenRejected'` (Notion refused NOTION_TOKEN) or `'busy'` (Notion busy or not answering)
+
+What changed for the UI: none of the signatures above changed. The batch id returned by an archive now equals the action's opId (keep using the returned value for Undo). A new arrow's id is `e:<opId>`. Use one opId per call. An invalid `position` or a `viewportWidth` outside 200–20,000 is ignored rather than stored.
+
+
+## Residual risks
+- **The browser must retry with the same opId.** With History written first, a failed action that is never retried leaves a row for a change that didn't land. The UI's write queue must retry failed writes with the original opId.
+- **Server Actions must catch `AppError`.** In production, Next masks errors thrown from Server Actions, so the actions need to catch it and return `{code, message, details}`.
+- **Notion query lag.** Jobs (create project, sync, import) record the id of every row they create and save it after every batch, read their job row by page id, and read steps the query does not show yet by id; reconcile and attachment counts do the same. Single-action retry checks (`hasOp`, stepKey of `addProjectStep`, `findByCode`, orphan adoption) still read through Notion queries, which can lag a fresh write by a few seconds, so a very fast retry could still duplicate. A crash between a job's create and its save can leave a second copy: finalize (and, for steps, reconcile) moves untouched copies to Notion's trash once the query shows them.
+- **Leases are not compare-and-set.** Notion has no conditional write. A takeover re-reads the job row by id after LEASE_SETTLE_MS, but if the old driver saves in that window its save can be overwritten; extra copies this leaves are cleaned up by finalize or reconcile, and in a narrow race a second History row can appear. After a slow call or a takeover another tab may wait up to 5 minutes before taking over the job of a closed tab.
+- **Copies are trashed only when nothing points at them.** Finalize and reconcile move a row to Notion's trash only when the freshly read flow and job record do not use it and nobody touched it (no value, note, link or file, created by this job's opId). Step copies left by a crash are cleaned up by reconcile on the next page view.
+- **Waits under lag.** `continue…` with an opId whose job row is not visible yet retries the lookup 4 times, 2 s apart (about 8 s before NOT_FOUND). A job save that Notion answers with a 5xx, a timeout or a dropped connection is sent once more. After an import create that failed, finalize waits up to 10 s (at most 8 waiting calls) so a copy Notion did save shows in the query and goes to the trash.
+- **Step writes after a crash.** A crash between the step write and the History append still gives a `resumed` row without the old value.
+- **Orphan adoption is a heuristic.** It looks back 15 minutes and at the newest 100 History rows of that type.
+- **Settings growth and size.** Finished-job records pile up in Settings. Job plans and template snapshots are bounded by Notion's ~200 KB text limit, so importing a file near the 1 MB maximum would fail to save its job.
+- **Import replaces the template flow.** Template edits made while an import job is paused are lost when it finishes.
+- **No lock.** Two tabs editing the same project can lose a cell update until reconcile runs, and two sync jobs on one project aren't locked (values, choices and flow are now protected).
+- **Revision bumps.** A retried action can bump the template revision twice; this is harmless.
