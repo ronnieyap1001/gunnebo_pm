@@ -1,0 +1,217 @@
+@import "tailwindcss";
+@import "tw-animate-css";
+@import "shadcn/tailwind.css";
+
+@custom-variant dark (&:is(.dark *));
+
+@theme inline {
+  --color-background: var(--background);
+  --color-foreground: var(--foreground);
+  --font-sans: var(--font-sans);
+  --font-mono: var(--font-geist-mono);
+  --font-heading: var(--font-sans);
+  --color-sidebar-ring: var(--sidebar-ring);
+  --color-sidebar-border: var(--sidebar-border);
+  --color-sidebar-accent-foreground: var(--sidebar-accent-foreground);
+  --color-sidebar-accent: var(--sidebar-accent);
+  --color-sidebar-primary-foreground: var(--sidebar-primary-foreground);
+  --color-sidebar-primary: var(--sidebar-primary);
+  --color-sidebar-foreground: var(--sidebar-foreground);
+  --color-sidebar: var(--sidebar);
+  --color-chart-5: var(--chart-5);
+  --color-chart-4: var(--chart-4);
+  --color-chart-3: var(--chart-3);
+  --color-chart-2: var(--chart-2);
+  --color-chart-1: var(--chart-1);
+  --color-ring: var(--ring);
+  --color-input: var(--input);
+  --color-border: var(--border);
+  --color-destructive: var(--destructive);
+  --color-accent-foreground: var(--accent-foreground);
+  --color-accent: var(--accent);
+  --color-muted-foreground: var(--muted-foreground);
+  --color-muted: var(--muted);
+  --color-secondary-foreground: var(--secondary-foreground);
+  --color-secondary: var(--secondary);
+  --color-primary-foreground: var(--primary-foreground);
+  --color-primary: var(--primary);
+  --color-popover-foreground: var(--popover-foreground);
+  --color-popover: var(--popover);
+  --color-card-foreground: var(--card-foreground);
+  --color-card: var(--card);
+  --radius-sm: calc(var(--radius) * 0.6);
+  --radius-md: calc(var(--radius) * 0.8);
+  --radius-lg: var(--radius);
+  --radius-xl: calc(var(--radius) * 1.4);
+  --radius-2xl: calc(var(--radius) * 1.8);
+  --radius-3xl: calc(var(--radius) * 2.2);
+  --radius-4xl: calc(var(--radius) * 2.6);
+}
+
+:root {
+  --background: oklch(1 0 0);
+  --foreground: oklch(0.145 0 0);
+  --card: oklch(1 0 0);
+  --card-foreground: oklch(0.145 0 0);
+  --popover: oklch(1 0 0);
+  --popover-foreground: oklch(0.145 0 0);
+  --primary: oklch(0.205 0 0);
+  --primary-foreground: oklch(0.985 0 0);
+  --secondary: oklch(0.97 0 0);
+  --secondary-foreground: oklch(0.205 0 0);
+  --muted: oklch(0.97 0 0);
+  --muted-foreground: oklch(0.556 0 0);
+  --accent: oklch(0.97 0 0);
+  --accent-foreground: oklch(0.205 0 0);
+  --destructive: oklch(0.577 0.245 27.325);
+  --border: oklch(0.922 0 0);
+  --input: oklch(0.922 0 0);
+  --ring: oklch(0.708 0 0);
+  --chart-1: oklch(0.87 0 0);
+  --chart-2: oklch(0.556 0 0);
+  --chart-3: oklch(0.439 0 0);
+  --chart-4: oklch(0.371 0 0);
+  --chart-5: oklch(0.269 0 0);
+  --radius: 0.625rem;
+  --sidebar: oklch(0.985 0 0);
+  --sidebar-foreground: oklch(0.145 0 0);
+  --sidebar-primary: oklch(0.205 0 0);
+  --sidebar-primary-foreground: oklch(0.985 0 0);
+  --sidebar-accent: oklch(0.97 0 0);
+  --sidebar-accent-foreground: oklch(0.205 0 0);
+  --sidebar-border: oklch(0.922 0 0);
+  --sidebar-ring: oklch(0.708 0 0);
+}
+
+.dark {
+  --background: oklch(0.145 0 0);
+  --foreground: oklch(0.985 0 0);
+  --card: oklch(0.205 0 0);
+  --card-foreground: oklch(0.985 0 0);
+  --popover: oklch(0.205 0 0);
+  --popover-foreground: oklch(0.985 0 0);
+  --primary: oklch(0.922 0 0);
+  --primary-foreground: oklch(0.205 0 0);
+  --secondary: oklch(0.269 0 0);
+  --secondary-foreground: oklch(0.985 0 0);
+  --muted: oklch(0.269 0 0);
+  --muted-foreground: oklch(0.708 0 0);
+  --accent: oklch(0.269 0 0);
+  --accent-foreground: oklch(0.985 0 0);
+  --destructive: oklch(0.704 0.191 22.216);
+  --border: oklch(1 0 0 / 10%);
+  --input: oklch(1 0 0 / 15%);
+  --ring: oklch(0.556 0 0);
+  --chart-1: oklch(0.87 0 0);
+  --chart-2: oklch(0.556 0 0);
+  --chart-3: oklch(0.439 0 0);
+  --chart-4: oklch(0.371 0 0);
+  --chart-5: oklch(0.269 0 0);
+  --sidebar: oklch(0.205 0 0);
+  --sidebar-foreground: oklch(0.985 0 0);
+  --sidebar-primary: oklch(0.488 0.243 264.376);
+  --sidebar-primary-foreground: oklch(0.985 0 0);
+  --sidebar-accent: oklch(0.269 0 0);
+  --sidebar-accent-foreground: oklch(0.985 0 0);
+  --sidebar-border: oklch(1 0 0 / 10%);
+  --sidebar-ring: oklch(0.556 0 0);
+}
+
+@layer base {
+  * {
+    @apply border-border outline-ring/50;
+  }
+  body {
+    @apply bg-background text-foreground;
+  }
+  html {
+    @apply font-sans;
+  }
+}
+/* ------------------------------------------------------------------------ */
+/* State colours (nodes, cells, chips, legend). Light first, then dark.      */
+/* Each state has: solid (stripe/dot), bg (tinted card), border, fg (text).  */
+/* ------------------------------------------------------------------------ */
+:root {
+  --state-ns-solid: oklch(0.62 0.02 255);
+  --state-ns-bg: oklch(0.975 0.004 255);
+  --state-ns-border: oklch(0.86 0.01 255);
+  --state-ns-fg: oklch(0.42 0.02 255);
+
+  --state-ip-solid: oklch(0.57 0.18 255);
+  --state-ip-bg: oklch(0.965 0.025 250);
+  --state-ip-border: oklch(0.78 0.09 252);
+  --state-ip-fg: oklch(0.42 0.15 258);
+
+  --state-w-solid: oklch(0.76 0.16 70);
+  --state-w-bg: oklch(0.975 0.045 85);
+  --state-w-border: oklch(0.84 0.12 78);
+  --state-w-fg: oklch(0.48 0.11 60);
+
+  --state-b-solid: oklch(0.59 0.22 25);
+  --state-b-bg: oklch(0.965 0.025 18);
+  --state-b-border: oklch(0.79 0.11 20);
+  --state-b-fg: oklch(0.48 0.19 26);
+
+  --state-d-solid: oklch(0.62 0.15 150);
+  --state-d-bg: oklch(0.965 0.035 152);
+  --state-d-border: oklch(0.8 0.1 152);
+  --state-d-fg: oklch(0.42 0.11 152);
+
+  --state-na-solid: oklch(0.78 0.005 255);
+  --state-na-bg: transparent;
+  --state-na-border: oklch(0.8 0.008 255);
+  --state-na-fg: oklch(0.6 0.01 255);
+
+  /* "Current milestone" ring: violet, not used by any state. */
+  --current-ring: oklch(0.58 0.22 300);
+}
+
+.dark {
+  --state-ns-solid: oklch(0.6 0.02 255);
+  --state-ns-bg: oklch(0.23 0.01 255);
+  --state-ns-border: oklch(0.36 0.015 255);
+  --state-ns-fg: oklch(0.8 0.015 255);
+
+  --state-ip-solid: oklch(0.65 0.17 255);
+  --state-ip-bg: oklch(0.27 0.06 255);
+  --state-ip-border: oklch(0.45 0.12 255);
+  --state-ip-fg: oklch(0.86 0.07 252);
+
+  --state-w-solid: oklch(0.78 0.15 75);
+  --state-w-bg: oklch(0.29 0.05 75);
+  --state-w-border: oklch(0.5 0.1 75);
+  --state-w-fg: oklch(0.88 0.1 82);
+
+  --state-b-solid: oklch(0.66 0.2 25);
+  --state-b-bg: oklch(0.28 0.07 22);
+  --state-b-border: oklch(0.5 0.14 24);
+  --state-b-fg: oklch(0.87 0.08 22);
+
+  --state-d-solid: oklch(0.68 0.15 150);
+  --state-d-bg: oklch(0.27 0.05 152);
+  --state-d-border: oklch(0.47 0.1 152);
+  --state-d-fg: oklch(0.86 0.08 152);
+
+  --state-na-solid: oklch(0.45 0.01 255);
+  --state-na-bg: transparent;
+  --state-na-border: oklch(0.4 0.01 255);
+  --state-na-fg: oklch(0.6 0.01 255);
+
+  --current-ring: oklch(0.7 0.19 300);
+}
+
+/* Utility classes: set a component's state colour variables in one place. */
+.state-ns { --s-solid: var(--state-ns-solid); --s-bg: var(--state-ns-bg); --s-border: var(--state-ns-border); --s-fg: var(--state-ns-fg); }
+.state-ip { --s-solid: var(--state-ip-solid); --s-bg: var(--state-ip-bg); --s-border: var(--state-ip-border); --s-fg: var(--state-ip-fg); }
+.state-w  { --s-solid: var(--state-w-solid);  --s-bg: var(--state-w-bg);  --s-border: var(--state-w-border);  --s-fg: var(--state-w-fg); }
+.state-b  { --s-solid: var(--state-b-solid);  --s-bg: var(--state-b-bg);  --s-border: var(--state-b-border);  --s-fg: var(--state-b-fg); }
+.state-d  { --s-solid: var(--state-d-solid);  --s-bg: var(--state-d-bg);  --s-border: var(--state-d-border);  --s-fg: var(--state-d-fg); }
+.state-na { --s-solid: var(--state-na-solid); --s-bg: var(--state-na-bg); --s-border: var(--state-na-border); --s-fg: var(--state-na-fg); }
+
+@layer base {
+  /* Dense work-tool defaults. */
+  body {
+    font-feature-settings: "tnum" 1, "cv11" 1;
+  }
+}

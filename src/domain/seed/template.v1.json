@@ -1,0 +1,865 @@
+{
+  "format": "gunnebo-pm.template",
+  "version": 1,
+  "milestones": [
+    {
+      "key": "enquiry-rfq-received",
+      "name": "Enquiry / RFQ received",
+      "fieldType": "DATE",
+      "order": 1,
+      "choices": []
+    },
+    {
+      "key": "pm-assigned",
+      "name": "PM assigned",
+      "fieldType": "DATE",
+      "order": 2,
+      "choices": []
+    },
+    {
+      "key": "customer-requirements",
+      "name": "Customer requirements & specification",
+      "fieldType": "DROPDOWN",
+      "order": 3,
+      "choices": [
+        { "id": "not-received", "label": "Not received", "state": "NOT_STARTED" },
+        { "id": "partial", "label": "Partial", "state": "IN_PROGRESS" },
+        { "id": "complete", "label": "Complete", "state": "DONE" }
+      ]
+    },
+    {
+      "key": "technical-qa",
+      "name": "Technical Q&A with customer",
+      "fieldType": "DROPDOWN",
+      "order": 4,
+      "choices": [
+        { "id": "not-started", "label": "Not started", "state": "NOT_STARTED" },
+        { "id": "questions-open", "label": "Questions open", "state": "WAITING" },
+        { "id": "all-answered", "label": "All answered", "state": "DONE" }
+      ]
+    },
+    {
+      "key": "factory-lead-time-costing",
+      "name": "Factory lead time & costing",
+      "fieldType": "DROPDOWN",
+      "order": 5,
+      "choices": [
+        { "id": "not-requested", "label": "Not requested", "state": "NOT_STARTED" },
+        { "id": "requested", "label": "Requested", "state": "WAITING" },
+        { "id": "received", "label": "Received", "state": "DONE" }
+      ]
+    },
+    {
+      "key": "proposal-offer",
+      "name": "Proposal / offer",
+      "fieldType": "DROPDOWN",
+      "order": 6,
+      "choices": [
+        { "id": "drafting", "label": "Drafting", "state": "IN_PROGRESS" },
+        { "id": "sent", "label": "Sent", "state": "WAITING" },
+        { "id": "revising", "label": "Revising", "state": "IN_PROGRESS" },
+        { "id": "accepted", "label": "Accepted", "state": "DONE" },
+        { "id": "lost", "label": "Lost", "state": "BLOCKED" }
+      ]
+    },
+    {
+      "key": "pre-po-approval",
+      "name": "Pre-PO work approval (engineering at risk, samples, advance production)",
+      "fieldType": "DROPDOWN",
+      "order": 7,
+      "choices": [
+        { "id": "not-needed", "label": "Not needed", "state": "NOT_APPLICABLE" },
+        { "id": "requested", "label": "Requested", "state": "WAITING" },
+        { "id": "approved", "label": "Approved", "state": "DONE" },
+        { "id": "rejected", "label": "Rejected", "state": "BLOCKED" }
+      ]
+    },
+    {
+      "key": "customer-po-loi",
+      "name": "Customer PO / LOI",
+      "fieldType": "DROPDOWN",
+      "order": 8,
+      "choices": [
+        { "id": "awaiting", "label": "Awaiting", "state": "WAITING" },
+        { "id": "loi-received", "label": "LOI received", "state": "IN_PROGRESS" },
+        { "id": "partial-po", "label": "Partial PO", "state": "IN_PROGRESS" },
+        { "id": "full-po", "label": "Full PO", "state": "DONE" },
+        { "id": "revised-po", "label": "Revised PO", "state": "DONE" }
+      ]
+    },
+    {
+      "key": "po-check-acknowledgement",
+      "name": "PO check & acknowledgement",
+      "fieldType": "DROPDOWN",
+      "order": 9,
+      "choices": [
+        { "id": "not-checked", "label": "Not checked", "state": "NOT_STARTED" },
+        { "id": "issues-raised", "label": "Issues raised", "state": "BLOCKED" },
+        { "id": "acknowledged", "label": "Acknowledged", "state": "DONE" }
+      ]
+    },
+    {
+      "key": "sales-pm-handover",
+      "name": "Sales-to-PM handover",
+      "fieldType": "DROPDOWN",
+      "order": 10,
+      "choices": [
+        { "id": "not-held", "label": "Not held", "state": "NOT_STARTED" },
+        { "id": "scheduled", "label": "Scheduled", "state": "IN_PROGRESS" },
+        { "id": "held-open-items", "label": "Held – open items", "state": "IN_PROGRESS" },
+        { "id": "closed", "label": "Closed", "state": "DONE" }
+      ]
+    },
+    {
+      "key": "project-number-setup",
+      "name": "Project number & set-up",
+      "fieldType": "DROPDOWN",
+      "order": 11,
+      "choices": [
+        { "id": "not-requested", "label": "Not requested", "state": "NOT_STARTED" },
+        { "id": "requested", "label": "Requested", "state": "WAITING" },
+        { "id": "issued-set-up", "label": "Issued & set up", "state": "DONE" }
+      ]
+    },
+    {
+      "key": "customer-account-part-numbers",
+      "name": "Customer account & part numbers",
+      "fieldType": "DROPDOWN",
+      "order": 12,
+      "choices": [
+        { "id": "not-needed", "label": "Not needed", "state": "NOT_APPLICABLE" },
+        { "id": "requested", "label": "Requested", "state": "WAITING" },
+        { "id": "ready", "label": "Ready", "state": "DONE" },
+        { "id": "blocked", "label": "Blocked", "state": "BLOCKED" }
+      ]
+    },
+    {
+      "key": "order-form",
+      "name": "Order form (Order Document)",
+      "fieldType": "DROPDOWN",
+      "order": 13,
+      "choices": [
+        { "id": "drafting", "label": "Drafting", "state": "IN_PROGRESS" },
+        { "id": "under-review", "label": "Under review", "state": "WAITING" },
+        { "id": "final", "label": "Final", "state": "DONE" },
+        { "id": "revised", "label": "Revised", "state": "DONE" }
+      ]
+    },
+    {
+      "key": "new-order-customer-service",
+      "name": "New order to Customer Service",
+      "fieldType": "DROPDOWN",
+      "order": 14,
+      "choices": [
+        { "id": "not-sent", "label": "Not sent", "state": "NOT_STARTED" },
+        { "id": "sent", "label": "Sent", "state": "WAITING" },
+        { "id": "queries-open", "label": "Queries open", "state": "BLOCKED" },
+        { "id": "accepted", "label": "Accepted", "state": "DONE" }
+      ]
+    },
+    {
+      "key": "o2f-shipment-requirements",
+      "name": "O2F shipment requirements form",
+      "fieldType": "DROPDOWN",
+      "order": 15,
+      "choices": [
+        { "id": "not-started", "label": "Not started", "state": "NOT_STARTED" },
+        { "id": "waiting-for-customer", "label": "Waiting for customer", "state": "WAITING" },
+        { "id": "submitted", "label": "Submitted", "state": "DONE" }
+      ]
+    },
+    {
+      "key": "intercompany-po",
+      "name": "Intercompany PO from Gunnebo entity",
+      "fieldType": "DROPDOWN",
+      "order": 16,
+      "choices": [
+        { "id": "not-applicable", "label": "Not applicable", "state": "NOT_APPLICABLE" },
+        { "id": "requested", "label": "Requested", "state": "WAITING" },
+        { "id": "received-without-values", "label": "Received without values", "state": "BLOCKED" },
+        { "id": "received", "label": "Received", "state": "DONE" }
+      ]
+    },
+    {
+      "key": "sales-order-confirmation",
+      "name": "Sales order confirmation",
+      "fieldType": "DROPDOWN",
+      "order": 17,
+      "choices": [
+        { "id": "pending", "label": "Pending", "state": "WAITING" },
+        { "id": "issued", "label": "Issued", "state": "IN_PROGRESS" },
+        { "id": "sent-to-customer", "label": "Sent to customer", "state": "DONE" },
+        { "id": "revised", "label": "Revised", "state": "DONE" }
+      ]
+    },
+    {
+      "key": "factory-po-soc",
+      "name": "Factory PO & confirmation (SOC)",
+      "fieldType": "DROPDOWN",
+      "order": 18,
+      "choices": [
+        { "id": "pending", "label": "Pending", "state": "WAITING" },
+        { "id": "po-issued", "label": "PO issued", "state": "IN_PROGRESS" },
+        { "id": "soc-received", "label": "SOC received", "state": "DONE" },
+        { "id": "revised", "label": "Revised", "state": "DONE" }
+      ]
+    },
+    {
+      "key": "kick-off-baseline",
+      "name": "Kick-off & baseline schedule",
+      "fieldType": "DROPDOWN",
+      "order": 19,
+      "choices": [
+        { "id": "not-started", "label": "Not started", "state": "NOT_STARTED" },
+        { "id": "kick-off-held", "label": "Kick-off held", "state": "IN_PROGRESS" },
+        { "id": "schedule-baselined", "label": "Schedule baselined", "state": "DONE" },
+        { "id": "re-planned", "label": "Re-planned", "state": "DONE" }
+      ]
+    },
+    {
+      "key": "invoice-milestones-obl",
+      "name": "Invoice milestones & OBL month",
+      "fieldType": "DROPDOWN",
+      "order": 20,
+      "choices": [
+        { "id": "not-set", "label": "Not set", "state": "NOT_STARTED" },
+        { "id": "set", "label": "Set", "state": "DONE" },
+        { "id": "changed", "label": "Changed", "state": "DONE" }
+      ]
+    },
+    {
+      "key": "engineering-job-request",
+      "name": "Engineering job request (SRG)",
+      "fieldType": "DROPDOWN",
+      "order": 21,
+      "choices": [
+        { "id": "not-needed", "label": "Not needed", "state": "NOT_APPLICABLE" },
+        { "id": "raised", "label": "Raised", "state": "WAITING" },
+        { "id": "in-progress", "label": "In progress", "state": "IN_PROGRESS" },
+        { "id": "done", "label": "Done", "state": "DONE" }
+      ]
+    },
+    {
+      "key": "specification-freeze",
+      "name": "Specification freeze",
+      "fieldType": "DROPDOWN",
+      "order": 22,
+      "choices": [
+        { "id": "open", "label": "Open", "state": "IN_PROGRESS" },
+        { "id": "frozen", "label": "Frozen", "state": "DONE" },
+        { "id": "changed-after-freeze", "label": "Changed after freeze", "state": "BLOCKED" }
+      ]
+    },
+    {
+      "key": "bom",
+      "name": "BOM",
+      "fieldType": "DROPDOWN",
+      "order": 23,
+      "choices": [
+        { "id": "not-started", "label": "Not started", "state": "NOT_STARTED" },
+        { "id": "requested", "label": "Requested", "state": "WAITING" },
+        { "id": "released", "label": "Released", "state": "DONE" },
+        { "id": "revised", "label": "Revised", "state": "DONE" }
+      ]
+    },
+    {
+      "key": "customer-drawings-approval",
+      "name": "Customer drawings & approval",
+      "fieldType": "DROPDOWN",
+      "order": 24,
+      "choices": [
+        { "id": "not-required", "label": "Not required", "state": "NOT_APPLICABLE" },
+        { "id": "requested-from-pe", "label": "Requested from PE", "state": "WAITING" },
+        { "id": "sent-to-customer", "label": "Sent to customer", "state": "WAITING" },
+        { "id": "comments-received", "label": "Comments received", "state": "IN_PROGRESS" },
+        { "id": "approved", "label": "Approved", "state": "DONE" }
+      ]
+    },
+    {
+      "key": "colour-finish-sample",
+      "name": "Colour / finish sample",
+      "fieldType": "DROPDOWN",
+      "order": 25,
+      "choices": [
+        { "id": "not-required", "label": "Not required", "state": "NOT_APPLICABLE" },
+        { "id": "in-production", "label": "In production", "state": "IN_PROGRESS" },
+        { "id": "sent", "label": "Sent", "state": "WAITING" },
+        { "id": "approved", "label": "Approved", "state": "DONE" },
+        { "id": "rejected", "label": "Rejected", "state": "BLOCKED" }
+      ]
+    },
+    {
+      "key": "peripherals-long-lead-parts",
+      "name": "Peripherals & long-lead parts (PC, readers, printers)",
+      "fieldType": "DROPDOWN",
+      "order": 26,
+      "choices": [
+        { "id": "not-applicable", "label": "Not applicable", "state": "NOT_APPLICABLE" },
+        { "id": "open", "label": "Open", "state": "IN_PROGRESS" },
+        { "id": "at-risk", "label": "At risk", "state": "BLOCKED" },
+        { "id": "shortage", "label": "Shortage", "state": "BLOCKED" },
+        { "id": "secured", "label": "Secured", "state": "DONE" }
+      ]
+    },
+    {
+      "key": "spare-parts-list",
+      "name": "Spare parts list",
+      "fieldType": "DROPDOWN",
+      "order": 27,
+      "choices": [
+        { "id": "not-required", "label": "Not required", "state": "NOT_APPLICABLE" },
+        { "id": "draft", "label": "Draft", "state": "IN_PROGRESS" },
+        { "id": "agreed", "label": "Agreed", "state": "IN_PROGRESS" },
+        { "id": "quoted", "label": "Quoted", "state": "WAITING" },
+        { "id": "ordered", "label": "Ordered", "state": "DONE" }
+      ]
+    },
+    {
+      "key": "change-requests",
+      "name": "Change requests",
+      "fieldType": "DROPDOWN",
+      "order": 28,
+      "choices": [
+        { "id": "none", "label": "None", "state": "NOT_APPLICABLE" },
+        { "id": "open", "label": "Open", "state": "IN_PROGRESS" },
+        { "id": "approved", "label": "Approved", "state": "DONE" },
+        { "id": "rejected", "label": "Rejected", "state": "DONE" }
+      ]
+    },
+    {
+      "key": "factory-ready-date",
+      "name": "Factory ready date",
+      "fieldType": "DATE",
+      "order": 29,
+      "choices": []
+    },
+    {
+      "key": "production-status",
+      "name": "Production status",
+      "fieldType": "DROPDOWN",
+      "order": 30,
+      "choices": [
+        { "id": "not-started", "label": "Not started", "state": "NOT_STARTED" },
+        { "id": "in-production", "label": "In production", "state": "IN_PROGRESS" },
+        { "id": "delayed", "label": "Delayed", "state": "BLOCKED" },
+        { "id": "completed", "label": "Completed", "state": "DONE" }
+      ]
+    },
+    {
+      "key": "quality-issues-ncn",
+      "name": "Quality issues / NCN",
+      "fieldType": "DROPDOWN",
+      "order": 31,
+      "choices": [
+        { "id": "none", "label": "None", "state": "NOT_APPLICABLE" },
+        { "id": "open", "label": "Open", "state": "BLOCKED" },
+        { "id": "closed", "label": "Closed", "state": "DONE" }
+      ]
+    },
+    {
+      "key": "fat-mode",
+      "name": "FAT mode",
+      "fieldType": "DROPDOWN",
+      "order": 32,
+      "choices": [
+        { "id": "remote", "label": "Remote", "state": "DONE" },
+        { "id": "witnessed-at-factory", "label": "Witnessed at factory", "state": "DONE" },
+        { "id": "internal-only", "label": "Internal only", "state": "DONE" },
+        { "id": "not-required", "label": "Not required", "state": "NOT_APPLICABLE" }
+      ]
+    },
+    {
+      "key": "fat-date",
+      "name": "FAT date",
+      "fieldType": "DATE",
+      "order": 33,
+      "choices": []
+    },
+    {
+      "key": "fat-report-acceptance",
+      "name": "FAT report & customer acceptance",
+      "fieldType": "DROPDOWN",
+      "order": 34,
+      "choices": [
+        { "id": "waiting-for-report", "label": "Waiting for report", "state": "WAITING" },
+        { "id": "report-sent", "label": "Report sent", "state": "WAITING" },
+        { "id": "punch-list-open", "label": "Punch list open", "state": "BLOCKED" },
+        { "id": "accepted", "label": "Accepted", "state": "DONE" },
+        { "id": "failed", "label": "Failed", "state": "BLOCKED" }
+      ]
+    },
+    {
+      "key": "delivery-split",
+      "name": "Delivery split",
+      "fieldType": "DROPDOWN",
+      "order": 35,
+      "choices": [
+        { "id": "single-shipment", "label": "Single shipment", "state": "DONE" },
+        { "id": "split-proposed", "label": "Split proposed", "state": "WAITING" },
+        { "id": "split-agreed", "label": "Split agreed", "state": "DONE" }
+      ]
+    },
+    {
+      "key": "packing-list",
+      "name": "Packing list",
+      "fieldType": "DROPDOWN",
+      "order": 36,
+      "choices": [
+        { "id": "not-requested", "label": "Not requested", "state": "NOT_STARTED" },
+        { "id": "estimated", "label": "Estimated", "state": "IN_PROGRESS" },
+        { "id": "official", "label": "Official", "state": "IN_PROGRESS" },
+        { "id": "sent-to-customer", "label": "Sent to customer", "state": "DONE" }
+      ]
+    },
+    {
+      "key": "shipping-documents",
+      "name": "Shipping documents required",
+      "fieldType": "MULTIPLE",
+      "order": 37,
+      "choices": [
+        { "id": "packing-list", "label": "Packing list" },
+        { "id": "commercial-invoice", "label": "Commercial invoice" },
+        { "id": "msds", "label": "MSDS" },
+        { "id": "battery-cert-un38-3", "label": "Battery cert (UN38.3)" },
+        { "id": "certificate-of-origin", "label": "Certificate of Origin" },
+        { "id": "form-e", "label": "Form E" },
+        { "id": "ce-doc", "label": "CE DoC" },
+        { "id": "fat-report", "label": "FAT report" },
+        { "id": "packing-photos", "label": "Packing photos" }
+      ]
+    },
+    {
+      "key": "freight-quotation-approval",
+      "name": "Freight quotation & approval",
+      "fieldType": "DROPDOWN",
+      "order": 38,
+      "choices": [
+        { "id": "not-required", "label": "Not required", "state": "NOT_APPLICABLE" },
+        { "id": "requested", "label": "Requested", "state": "WAITING" },
+        { "id": "quoted", "label": "Quoted", "state": "WAITING" },
+        { "id": "approved", "label": "Approved", "state": "DONE" }
+      ]
+    },
+    {
+      "key": "ready-for-collection",
+      "name": "Ready for collection",
+      "fieldType": "DATE",
+      "order": 39,
+      "choices": []
+    },
+    {
+      "key": "storage-at-factory",
+      "name": "Storage at factory",
+      "fieldType": "DROPDOWN",
+      "order": 40,
+      "choices": [
+        { "id": "not-needed", "label": "Not needed", "state": "NOT_APPLICABLE" },
+        { "id": "charging", "label": "Charging", "state": "BLOCKED" },
+        { "id": "cost-agreed", "label": "Cost agreed", "state": "DONE" }
+      ]
+    },
+    {
+      "key": "picked-up-etd",
+      "name": "Picked up / ETD",
+      "fieldType": "DATE",
+      "order": 41,
+      "choices": []
+    },
+    {
+      "key": "eta",
+      "name": "ETA",
+      "fieldType": "DATE",
+      "order": 42,
+      "choices": []
+    },
+    {
+      "key": "import-clearance-permits",
+      "name": "Import clearance & permits",
+      "fieldType": "DROPDOWN",
+      "order": 43,
+      "choices": [
+        { "id": "not-applicable", "label": "Not applicable", "state": "NOT_APPLICABLE" },
+        { "id": "pending", "label": "Pending", "state": "WAITING" },
+        { "id": "cleared", "label": "Cleared", "state": "DONE" }
+      ]
+    },
+    {
+      "key": "delivered-pod",
+      "name": "Delivered (proof of delivery)",
+      "fieldType": "DATE",
+      "order": 44,
+      "choices": []
+    },
+    {
+      "key": "signed-delivery-order",
+      "name": "Signed delivery order / Deed of Ownership",
+      "fieldType": "DROPDOWN",
+      "order": 45,
+      "choices": [
+        { "id": "not-required", "label": "Not required", "state": "NOT_APPLICABLE" },
+        { "id": "pending", "label": "Pending", "state": "WAITING" },
+        { "id": "signed", "label": "Signed", "state": "DONE" }
+      ]
+    },
+    {
+      "key": "site-readiness-access",
+      "name": "Site readiness & access (induction, visas)",
+      "fieldType": "DROPDOWN",
+      "order": 46,
+      "choices": [
+        { "id": "not-ready", "label": "Not ready", "state": "WAITING" },
+        { "id": "ready-access-pending", "label": "Ready – access pending", "state": "WAITING" },
+        { "id": "ready", "label": "Ready", "state": "DONE" }
+      ]
+    },
+    {
+      "key": "installer-quote-po",
+      "name": "Installer (quote → PO)",
+      "fieldType": "DROPDOWN",
+      "order": 47,
+      "choices": [
+        { "id": "not-required", "label": "Not required", "state": "NOT_APPLICABLE" },
+        { "id": "rfq-sent", "label": "RFQ sent", "state": "WAITING" },
+        { "id": "quote-selected", "label": "Quote selected", "state": "IN_PROGRESS" },
+        { "id": "po-issued", "label": "PO issued", "state": "DONE" }
+      ]
+    },
+    {
+      "key": "installation-start",
+      "name": "Installation start",
+      "fieldType": "DATE",
+      "order": 48,
+      "choices": []
+    },
+    {
+      "key": "installation-progress",
+      "name": "Installation progress",
+      "fieldType": "PERCENT",
+      "order": 49,
+      "choices": []
+    },
+    {
+      "key": "training",
+      "name": "Training",
+      "fieldType": "DROPDOWN",
+      "order": 50,
+      "choices": [
+        { "id": "not-required", "label": "Not required", "state": "NOT_APPLICABLE" },
+        { "id": "planned", "label": "Planned", "state": "IN_PROGRESS" },
+        { "id": "done", "label": "Done", "state": "DONE" }
+      ]
+    },
+    {
+      "key": "sat-commissioning",
+      "name": "SAT / commissioning",
+      "fieldType": "DROPDOWN",
+      "order": 51,
+      "choices": [
+        { "id": "not-started", "label": "Not started", "state": "NOT_STARTED" },
+        { "id": "scheduled", "label": "Scheduled", "state": "IN_PROGRESS" },
+        { "id": "passed", "label": "Passed", "state": "DONE" },
+        { "id": "passed-with-punch-list", "label": "Passed with punch list", "state": "IN_PROGRESS" },
+        { "id": "failed", "label": "Failed", "state": "BLOCKED" }
+      ]
+    },
+    {
+      "key": "handover-documents",
+      "name": "Handover documents",
+      "fieldType": "DROPDOWN",
+      "order": 52,
+      "choices": [
+        { "id": "not-sent", "label": "Not sent", "state": "NOT_STARTED" },
+        { "id": "sent", "label": "Sent", "state": "WAITING" },
+        { "id": "accepted", "label": "Accepted", "state": "DONE" }
+      ]
+    },
+    {
+      "key": "customer-acceptance-certificate",
+      "name": "Customer acceptance certificate",
+      "fieldType": "DROPDOWN",
+      "order": 53,
+      "choices": [
+        { "id": "not-requested", "label": "Not requested", "state": "NOT_STARTED" },
+        { "id": "requested", "label": "Requested", "state": "WAITING" },
+        { "id": "signed", "label": "Signed", "state": "DONE" }
+      ]
+    },
+    {
+      "key": "advance-invoice",
+      "name": "Advance invoice",
+      "fieldType": "DROPDOWN",
+      "order": 54,
+      "choices": [
+        { "id": "not-applicable", "label": "Not applicable", "state": "NOT_APPLICABLE" },
+        { "id": "not-due", "label": "Not due", "state": "NOT_STARTED" },
+        { "id": "invoiceable", "label": "Invoiceable", "state": "IN_PROGRESS" },
+        { "id": "raised", "label": "Raised", "state": "IN_PROGRESS" },
+        { "id": "sent", "label": "Sent", "state": "WAITING" },
+        { "id": "disputed", "label": "Disputed", "state": "BLOCKED" },
+        { "id": "overdue", "label": "Overdue", "state": "BLOCKED" },
+        { "id": "paid", "label": "Paid", "state": "DONE" }
+      ]
+    },
+    {
+      "key": "pre-delivery-invoice",
+      "name": "Pre-delivery invoice",
+      "fieldType": "DROPDOWN",
+      "order": 55,
+      "choices": [
+        { "id": "not-applicable", "label": "Not applicable", "state": "NOT_APPLICABLE" },
+        { "id": "not-due", "label": "Not due", "state": "NOT_STARTED" },
+        { "id": "invoiceable", "label": "Invoiceable", "state": "IN_PROGRESS" },
+        { "id": "raised", "label": "Raised", "state": "IN_PROGRESS" },
+        { "id": "sent", "label": "Sent", "state": "WAITING" },
+        { "id": "disputed", "label": "Disputed", "state": "BLOCKED" },
+        { "id": "overdue", "label": "Overdue", "state": "BLOCKED" },
+        { "id": "paid", "label": "Paid", "state": "DONE" }
+      ]
+    },
+    {
+      "key": "arrival-delivery-invoice",
+      "name": "Arrival / delivery invoice",
+      "fieldType": "DROPDOWN",
+      "order": 56,
+      "choices": [
+        { "id": "not-applicable", "label": "Not applicable", "state": "NOT_APPLICABLE" },
+        { "id": "not-due", "label": "Not due", "state": "NOT_STARTED" },
+        { "id": "invoiceable", "label": "Invoiceable", "state": "IN_PROGRESS" },
+        { "id": "raised", "label": "Raised", "state": "IN_PROGRESS" },
+        { "id": "sent", "label": "Sent", "state": "WAITING" },
+        { "id": "disputed", "label": "Disputed", "state": "BLOCKED" },
+        { "id": "overdue", "label": "Overdue", "state": "BLOCKED" },
+        { "id": "paid", "label": "Paid", "state": "DONE" }
+      ]
+    },
+    {
+      "key": "installation-invoice",
+      "name": "Installation invoice",
+      "fieldType": "DROPDOWN",
+      "order": 57,
+      "choices": [
+        { "id": "not-applicable", "label": "Not applicable", "state": "NOT_APPLICABLE" },
+        { "id": "not-due", "label": "Not due", "state": "NOT_STARTED" },
+        { "id": "invoiceable", "label": "Invoiceable", "state": "IN_PROGRESS" },
+        { "id": "raised", "label": "Raised", "state": "IN_PROGRESS" },
+        { "id": "sent", "label": "Sent", "state": "WAITING" },
+        { "id": "disputed", "label": "Disputed", "state": "BLOCKED" },
+        { "id": "overdue", "label": "Overdue", "state": "BLOCKED" },
+        { "id": "paid", "label": "Paid", "state": "DONE" }
+      ]
+    },
+    {
+      "key": "acceptance-retention-invoice",
+      "name": "Acceptance / retention invoice",
+      "fieldType": "DROPDOWN",
+      "order": 58,
+      "choices": [
+        { "id": "not-applicable", "label": "Not applicable", "state": "NOT_APPLICABLE" },
+        { "id": "not-due", "label": "Not due", "state": "NOT_STARTED" },
+        { "id": "invoiceable", "label": "Invoiceable", "state": "IN_PROGRESS" },
+        { "id": "raised", "label": "Raised", "state": "IN_PROGRESS" },
+        { "id": "sent", "label": "Sent", "state": "WAITING" },
+        { "id": "disputed", "label": "Disputed", "state": "BLOCKED" },
+        { "id": "overdue", "label": "Overdue", "state": "BLOCKED" },
+        { "id": "paid", "label": "Paid", "state": "DONE" }
+      ]
+    },
+    {
+      "key": "credit-notes-disputes",
+      "name": "Credit notes / invoice disputes",
+      "fieldType": "DROPDOWN",
+      "order": 59,
+      "choices": [
+        { "id": "none", "label": "None", "state": "NOT_APPLICABLE" },
+        { "id": "open", "label": "Open", "state": "BLOCKED" },
+        { "id": "credit-note-issued", "label": "Credit note issued", "state": "DONE" }
+      ]
+    },
+    {
+      "key": "warranty-period",
+      "name": "Warranty period",
+      "fieldType": "DATE_RANGE",
+      "order": 60,
+      "choices": []
+    },
+    {
+      "key": "warranty-claims",
+      "name": "Warranty claims",
+      "fieldType": "DROPDOWN",
+      "order": 61,
+      "choices": [
+        { "id": "none", "label": "None", "state": "NOT_APPLICABLE" },
+        { "id": "open", "label": "Open", "state": "BLOCKED" },
+        { "id": "closed", "label": "Closed", "state": "DONE" }
+      ]
+    },
+    {
+      "key": "spares-maintenance-amc-handover",
+      "name": "Spares & maintenance (AMC) handover",
+      "fieldType": "DROPDOWN",
+      "order": 62,
+      "choices": [
+        { "id": "not-applicable", "label": "Not applicable", "state": "NOT_APPLICABLE" },
+        { "id": "pending", "label": "Pending", "state": "WAITING" },
+        { "id": "done", "label": "Done", "state": "DONE" }
+      ]
+    },
+    {
+      "key": "lessons-learned",
+      "name": "Lessons learned",
+      "fieldType": "TEXT",
+      "order": 63,
+      "choices": []
+    },
+    {
+      "key": "project-closed",
+      "name": "Project closed",
+      "fieldType": "DATE",
+      "order": 64,
+      "choices": []
+    }
+  ],
+  "edges": [
+    { "from": "enquiry-rfq-received", "to": "pm-assigned" },
+    { "from": "pm-assigned", "to": "customer-requirements" },
+    { "from": "customer-requirements", "to": "technical-qa" },
+    { "from": "technical-qa", "to": "factory-lead-time-costing" },
+    { "from": "factory-lead-time-costing", "to": "proposal-offer" },
+    { "from": "proposal-offer", "to": "pre-po-approval" },
+    { "from": "pre-po-approval", "to": "customer-po-loi" },
+    { "from": "customer-po-loi", "to": "po-check-acknowledgement" },
+    { "from": "po-check-acknowledgement", "to": "sales-pm-handover" },
+    { "from": "sales-pm-handover", "to": "project-number-setup" },
+    { "from": "project-number-setup", "to": "customer-account-part-numbers" },
+    { "from": "customer-account-part-numbers", "to": "order-form" },
+    { "from": "order-form", "to": "new-order-customer-service" },
+    { "from": "new-order-customer-service", "to": "o2f-shipment-requirements" },
+    { "from": "o2f-shipment-requirements", "to": "intercompany-po" },
+    { "from": "intercompany-po", "to": "sales-order-confirmation" },
+    { "from": "sales-order-confirmation", "to": "factory-po-soc" },
+    { "from": "factory-po-soc", "to": "kick-off-baseline" },
+    { "from": "kick-off-baseline", "to": "invoice-milestones-obl" },
+    { "from": "invoice-milestones-obl", "to": "engineering-job-request" },
+    { "from": "engineering-job-request", "to": "specification-freeze" },
+    { "from": "specification-freeze", "to": "bom" },
+    { "from": "bom", "to": "customer-drawings-approval" },
+    { "from": "customer-drawings-approval", "to": "colour-finish-sample" },
+    { "from": "colour-finish-sample", "to": "peripherals-long-lead-parts" },
+    { "from": "peripherals-long-lead-parts", "to": "spare-parts-list" },
+    { "from": "spare-parts-list", "to": "change-requests" },
+    { "from": "change-requests", "to": "factory-ready-date" },
+    { "from": "factory-ready-date", "to": "production-status" },
+    { "from": "production-status", "to": "quality-issues-ncn" },
+    { "from": "quality-issues-ncn", "to": "fat-mode" },
+    { "from": "fat-mode", "to": "fat-date" },
+    { "from": "fat-date", "to": "fat-report-acceptance" },
+    { "from": "fat-report-acceptance", "to": "delivery-split" },
+    { "from": "delivery-split", "to": "packing-list" },
+    { "from": "packing-list", "to": "shipping-documents" },
+    { "from": "shipping-documents", "to": "freight-quotation-approval" },
+    { "from": "freight-quotation-approval", "to": "ready-for-collection" },
+    { "from": "ready-for-collection", "to": "storage-at-factory" },
+    { "from": "storage-at-factory", "to": "picked-up-etd" },
+    { "from": "picked-up-etd", "to": "eta" },
+    { "from": "eta", "to": "import-clearance-permits" },
+    { "from": "import-clearance-permits", "to": "delivered-pod" },
+    { "from": "delivered-pod", "to": "signed-delivery-order" },
+    { "from": "signed-delivery-order", "to": "site-readiness-access" },
+    { "from": "site-readiness-access", "to": "installer-quote-po" },
+    { "from": "installer-quote-po", "to": "installation-start" },
+    { "from": "installation-start", "to": "installation-progress" },
+    { "from": "installation-progress", "to": "training" },
+    { "from": "training", "to": "sat-commissioning" },
+    { "from": "sat-commissioning", "to": "handover-documents" },
+    { "from": "handover-documents", "to": "customer-acceptance-certificate" },
+    { "from": "customer-acceptance-certificate", "to": "advance-invoice" },
+    { "from": "advance-invoice", "to": "pre-delivery-invoice" },
+    { "from": "pre-delivery-invoice", "to": "arrival-delivery-invoice" },
+    { "from": "arrival-delivery-invoice", "to": "installation-invoice" },
+    { "from": "installation-invoice", "to": "acceptance-retention-invoice" },
+    { "from": "acceptance-retention-invoice", "to": "credit-notes-disputes" },
+    { "from": "credit-notes-disputes", "to": "warranty-period" },
+    { "from": "warranty-period", "to": "warranty-claims" },
+    { "from": "warranty-claims", "to": "spares-maintenance-amc-handover" },
+    { "from": "spares-maintenance-amc-handover", "to": "lessons-learned" },
+    { "from": "lessons-learned", "to": "project-closed" }
+  ],
+  "projectFields": [
+    {
+      "key": "customer",
+      "systemKey": "customer",
+      "label": "Customer",
+      "fieldType": "DROPDOWN",
+      "choices": [
+        { "id": "sita", "label": "SITA" },
+        { "id": "idemia", "label": "IDEMIA" },
+        { "id": "nec", "label": "NEC" },
+        { "id": "collins-aerospace", "label": "Collins Aerospace" }
+      ],
+      "order": 1,
+      "showInSummary": true
+    },
+    {
+      "key": "end-user",
+      "label": "End user",
+      "fieldType": "TEXT",
+      "choices": [],
+      "order": 2,
+      "showInSummary": true
+    },
+    {
+      "key": "site-country",
+      "label": "Site / country",
+      "fieldType": "TEXT",
+      "choices": [],
+      "order": 3,
+      "showInSummary": true
+    },
+    {
+      "key": "product",
+      "label": "Product",
+      "fieldType": "DROPDOWN",
+      "choices": [
+        { "id": "afl", "label": "AFL" },
+        { "id": "afl-compact", "label": "AFL-Compact" },
+        { "id": "immsec", "label": "ImmSec" },
+        { "id": "abcs", "label": "ABCS" }
+      ],
+      "order": 4,
+      "showInSummary": true
+    },
+    {
+      "key": "quantity",
+      "label": "Quantity",
+      "fieldType": "NUMBER",
+      "choices": [],
+      "config": {
+        "unit": "pcs"
+      },
+      "order": 5,
+      "showInSummary": true
+    },
+    {
+      "key": "project-type",
+      "systemKey": "projectType",
+      "label": "Project type",
+      "fieldType": "DROPDOWN",
+      "choices": [
+        { "id": "project", "label": "Project" },
+        { "id": "spare-order", "label": "Spare order" },
+        { "id": "adhoc", "label": "Adhoc" },
+        { "id": "warranty-replacement", "label": "Warranty replacement" }
+      ],
+      "order": 6,
+      "showInSummary": true
+    },
+    {
+      "key": "notes",
+      "label": "Notes",
+      "fieldType": "LONG_TEXT",
+      "choices": [],
+      "order": 7,
+      "showInSummary": false
+    }
+  ]
+}
