@@ -5,6 +5,8 @@ import { readSetupStatus } from "../setup/status";
 import { requireReadyStorage } from "@/server/guards";
 
 export const metadata = { title: "Settings" };
+/** Server Actions on this page include imports that write many Notion rows: allow the full 5 minutes. */
+export const maxDuration = 300;
 
 export default async function Page({ searchParams }: { searchParams: Promise<Record<string, string | string[] | undefined>> }) {
   await requireReadyStorage();

@@ -1,5 +1,7 @@
 import { expect, test, type Page } from "@playwright/test";
 import fs from "node:fs";
+import os from "node:os";
+import path from "node:path";
 import { E2E_FAKE_FILE, E2E_PASSWORD } from "../../playwright.config";
 
 /**
@@ -133,6 +135,37 @@ test("a template change reaches the project only through Sync, and keeps the val
   await expect(row).toContainText("Full PO received", { timeout: 60_000 });
   await expect(page.getByText("Template changed since the last sync")).toBeHidden();
   await expect(row).toHaveAttribute("data-state", "DONE");
+});
+
+test("Settings imports a progress file: preview first, then saved and shown in Projects", async ({ page }) => {
+  await signIn(page);
+  const file = path.join(os.tmpdir(), "gunnebo-pm-e2e", "progress.json");
+  fs.writeFileSync(
+    file,
+    JSON.stringify({
+      format: "gunnebo-pm-progress",
+      version: 1,
+      projects: [
+        {
+          code: "C0777",
+          name: "E2E imported project",
+          details: { customer: "SITA", "site-country": "Hanoi, Vietnam", quantity: 4 },
+          steps: { "customer-po-loi": { value: "Full PO" }, bom: { value: "Requested", flag: "WAITING", flagReason: "PE has not released it." } },
+          notes: ["Status 3 Nov: imported by the end-to-end test."],
+        },
+      ],
+    }),
+  );
+  await page.goto("/settings");
+  await page.locator("#progress-file").setInputFiles(file);
+  await expect(page.getByText(/progress\.json: 1 project/)).toBeVisible({ timeout: 60_000 });
+  await expect(page.getByText(/Nothing is saved until you click Apply/)).toBeVisible();
+  await page.getByRole("button", { name: /^Apply / }).click();
+  await expect(page.getByText("Import finished", { exact: true })).toBeVisible({ timeout: 180_000 });
+
+  await page.goto("/projects");
+  await expect(page.getByText("C0777").first()).toBeVisible();
+  await expect(page.getByText("E2E imported project").first()).toBeVisible();
 });
 
 test("Excel export downloads a workbook", async ({ page }) => {
