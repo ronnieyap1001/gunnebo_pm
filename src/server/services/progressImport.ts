@@ -176,8 +176,9 @@ export async function runProgressImport(repo: Repo, input: unknown, opts: Progre
     if (!project) {
       if (!apply) {
         add({ code, what: `create project "${spec.name}"`, outcome: "planned" });
-        planSteps(spec, code, virtualSteps());
-        planExtras(spec, code);
+        const none: Existing = { notes: [], atts: [] };
+        planSteps(spec, code, virtualSteps(), none);
+        planExtras(spec, code, none);
         return;
       }
       project = await createProject(spec, code, details);
@@ -191,8 +192,10 @@ export async function runProgressImport(repo: Repo, input: unknown, opts: Progre
     }
     const steps = await withKnownSteps(repo, project, await repo.steps.listByProject(project.id));
     if (!apply) {
-      planSteps(spec, code, steps);
-      planExtras(spec, code);
+      // The same checks as applying, so a file that is already in the app previews as nothing to change.
+      const existing = { notes: await repo.notes.listByProject(project.id), atts: await repo.attachments.listByProject(project.id) };
+      planSteps(spec, code, steps, existing);
+      planExtras(spec, code, existing);
       return;
     }
     await applySteps(spec, code, project, steps);
@@ -302,7 +305,7 @@ export async function runProgressImport(repo: Repo, input: unknown, opts: Progre
     return { step, value: ok.value };
   }
 
-  function planSteps(spec: ProgressProject, code: string, steps: StepLike[]): void {
+  function planSteps(spec: ProgressProject, code: string, steps: StepLike[], existing: Existing): void {
     const byKey = new Map(steps.filter((s) => s.milestoneKey).map((s) => [s.milestoneKey!, s]));
     for (const [key, s] of Object.entries(spec.steps ?? {})) {
       const c = check(code, key, s, byKey.get(key));
@@ -323,22 +326,46 @@ export async function runProgressImport(repo: Repo, input: unknown, opts: Progre
       }
       if (s.flag && !s.na) {
         if (step.flag === s.flag) add({ code, what: `${name}: flag ${s.flag}`, outcome: "unchanged" });
+        else if (!importMayFlag(step)) add({ code, what: `${name}: flag ${s.flag}`, outcome: "skipped", detail: `Flagged ${step.flag} in the app; left as is.` });
         else add({ code, what: `${name}: flag ${s.flag}${s.flagReason ? ` (${s.flagReason})` : ""}`, outcome: "planned" });
       }
-      if (s.note) add({ code, what: `${name}: note "${snippet(s.note)}"`, outcome: "planned" });
-      for (const l of s.links ?? []) add({ code, what: `${name}: link ${l.name ?? l.url}`, outcome: "planned" });
+      if (s.note) {
+        if (hasNote(existing.notes, step.id, s.note)) add({ code, what: `${name}: note`, outcome: "unchanged" });
+        else {
+          add({ code, what: `${name}: note "${snippet(s.note)}"`, outcome: "planned" });
+          existing.notes.push({ stepId: step.id, body: s.note.trim() });
+        }
+      }
+      for (const l of s.links ?? []) {
+        if (hasLink(existing.atts, step.id, l.url)) add({ code, what: `${name}: link ${l.name ?? l.url}`, outcome: "unchanged" });
+        else {
+          add({ code, what: `${name}: link ${l.name ?? l.url}`, outcome: "planned" });
+          existing.atts.push({ stepId: step.id, kind: "LINK", url: l.url.trim() });
+        }
+      }
     }
   }
 
-  function planExtras(spec: ProgressProject, code: string): void {
-    for (const body of spec.notes ?? []) add({ code, what: `project note "${snippet(body)}"`, outcome: "planned" });
-    for (const l of spec.links ?? []) add({ code, what: `project link ${l.name ?? l.url}`, outcome: "planned" });
+  function planExtras(spec: ProgressProject, code: string, existing: Existing): void {
+    for (const body of spec.notes ?? []) {
+      if (hasNote(existing.notes, null, body)) add({ code, what: "project note", outcome: "unchanged" });
+      else {
+        add({ code, what: `project note "${snippet(body)}"`, outcome: "planned" });
+        existing.notes.push({ body: body.trim() });
+      }
+    }
+    for (const l of spec.links ?? []) {
+      if (hasLink(existing.atts, null, l.url)) add({ code, what: `project link ${l.name ?? l.url}`, outcome: "unchanged" });
+      else {
+        add({ code, what: `project link ${l.name ?? l.url}`, outcome: "planned" });
+        existing.atts.push({ kind: "LINK", url: l.url.trim() });
+      }
+    }
   }
 
   async function applySteps(spec: ProgressProject, code: string, project: Project, steps: StoredStep[]): Promise<void> {
     const byKey = new Map(steps.filter((s) => s.milestoneKey && !s.archived).map((s) => [s.milestoneKey!, s]));
-    const notes = await repo.notes.listByProject(project.id);
-    const atts = await repo.attachments.listByProject(project.id);
+    const existing: Existing = { notes: await repo.notes.listByProject(project.id), atts: await repo.attachments.listByProject(project.id) };
     for (const [key, s] of Object.entries(spec.steps ?? {})) {
       const listed = byKey.get(key);
       const step = listed ? ((await repo.steps.get(listed.id)) ?? listed) : undefined;
@@ -349,7 +376,7 @@ export async function runProgressImport(repo: Repo, input: unknown, opts: Progre
         continue;
       }
       try {
-        await applyStep(code, project, step, s, c.value, notes, atts);
+        await applyStep(code, project, step, s, c.value, existing);
       } catch (e) {
         add({ code, what: name, outcome: "error", detail: e instanceof Error ? e.message : String(e) });
       }
@@ -362,8 +389,7 @@ export async function runProgressImport(repo: Repo, input: unknown, opts: Progre
     first: StoredStep,
     s: ProgressStep,
     value: Value | null | undefined,
-    notes: { stepId?: string; body: string; archived?: boolean }[],
-    atts: { stepId?: string; url?: string; kind: string; archived?: boolean }[],
+    existing: Existing,
   ): Promise<void> {
     const name = first.name;
     const fresh = async () => (await repo.steps.get(first.id)) ?? first;
@@ -387,7 +413,7 @@ export async function runProgressImport(repo: Repo, input: unknown, opts: Progre
     if (s.flag && !s.na) {
       step = await fresh();
       if (step.flag === s.flag) add({ code, what: `${name}: flag ${s.flag}`, outcome: "unchanged" });
-      else if (step.flag && !step.lastOp?.startsWith(IMPORT_OP_PREFIX)) add({ code, what: `${name}: flag ${s.flag}`, outcome: "skipped", detail: `Flagged ${step.flag} in the app; left as is.` });
+      else if (!importMayFlag(step)) add({ code, what: `${name}: flag ${s.flag}`, outcome: "skipped", detail: `Flagged ${step.flag} in the app; left as is.` });
       else {
         await setStepFlag(await ctxFor(importOpId("flag", code, step.milestoneKey, s.flag, s.flagReason ?? ""), s.externalRef), {
           stepId: step.id,
@@ -400,48 +426,76 @@ export async function runProgressImport(repo: Repo, input: unknown, opts: Progre
     }
     if (s.note) {
       const body = s.note.trim();
-      if (notes.some((n) => !n.archived && n.stepId === first.id && n.body.trim() === body)) add({ code, what: `${name}: note`, outcome: "unchanged" });
+      if (hasNote(existing.notes, first.id, body)) add({ code, what: `${name}: note`, outcome: "unchanged" });
       else {
         await addNote(await ctxFor(importOpId("note", code, first.milestoneKey, body), s.externalRef), { projectId: project.id, stepId: first.id, body });
+        existing.notes.push({ stepId: first.id, body });
         add({ code, what: `${name}: note "${snippet(body)}"`, outcome: "done" });
       }
     }
     for (const l of s.links ?? []) {
-      if (atts.some((a) => !a.archived && a.kind === "LINK" && a.stepId === first.id && a.url === l.url.trim())) {
+      const url = l.url.trim();
+      if (hasLink(existing.atts, first.id, url)) {
         add({ code, what: `${name}: link ${l.name ?? l.url}`, outcome: "unchanged" });
         continue;
       }
-      await addLink(await ctxFor(importOpId("link", code, first.milestoneKey, l.url.trim()), s.externalRef), {
+      await addLink(await ctxFor(importOpId("link", code, first.milestoneKey, url), s.externalRef), {
         projectId: project.id,
         stepId: first.id,
-        url: l.url.trim(),
+        url,
         ...(l.name ? { name: l.name } : {}),
       });
+      existing.atts.push({ stepId: first.id, kind: "LINK", url });
       add({ code, what: `${name}: link ${l.name ?? l.url}`, outcome: "done" });
     }
   }
 
   async function applyExtras(spec: ProgressProject, code: string, project: Project): Promise<void> {
-    const notes = await repo.notes.listByProject(project.id);
+    const existing: Existing = { notes: await repo.notes.listByProject(project.id), atts: await repo.attachments.listByProject(project.id) };
     for (const raw of spec.notes ?? []) {
       const body = raw.trim();
-      if (notes.some((n) => !n.archived && !n.stepId && n.body.trim() === body)) {
+      if (hasNote(existing.notes, null, body)) {
         add({ code, what: "project note", outcome: "unchanged" });
         continue;
       }
       await addNote(await ctxFor(importOpId("note", code, null, body)), { projectId: project.id, body });
+      existing.notes.push({ body });
       add({ code, what: `project note "${snippet(body)}"`, outcome: "done" });
     }
-    const atts = await repo.attachments.listByProject(project.id);
     for (const l of spec.links ?? []) {
-      if (atts.some((a) => !a.archived && a.kind === "LINK" && !a.stepId && a.url === l.url.trim())) {
+      const url = l.url.trim();
+      if (hasLink(existing.atts, null, url)) {
         add({ code, what: `project link ${l.name ?? l.url}`, outcome: "unchanged" });
         continue;
       }
-      await addLink(await ctxFor(importOpId("link", code, null, l.url.trim())), { projectId: project.id, url: l.url.trim(), ...(l.name ? { name: l.name } : {}) });
+      await addLink(await ctxFor(importOpId("link", code, null, url)), { projectId: project.id, url, ...(l.name ? { name: l.name } : {}) });
+      existing.atts.push({ kind: "LINK", url });
       add({ code, what: `project link ${l.name ?? l.url}`, outcome: "done" });
     }
   }
+}
+
+/** The notes and links a project already has (plus the ones this run adds), for spotting duplicates. */
+interface Existing {
+  notes: { stepId?: string; body: string; archived?: boolean }[];
+  atts: { stepId?: string; url?: string; kind: string; archived?: boolean }[];
+}
+
+/** Whether the project already has this note on this step (stepId null: on the project itself). */
+function hasNote(notes: Existing["notes"], stepId: string | null, body: string): boolean {
+  const b = body.trim();
+  return notes.some((n) => !n.archived && (n.stepId || null) === stepId && n.body.trim() === b);
+}
+
+/** Whether the project already has a link to this URL on this step (stepId null: on the project itself). */
+function hasLink(atts: Existing["atts"], stepId: string | null, url: string): boolean {
+  const u = url.trim();
+  return atts.some((a) => !a.archived && a.kind === "LINK" && (a.stepId || null) === stepId && a.url === u);
+}
+
+/** The import may set a flag when the step has none, or when the step's last change came from an import. */
+function importMayFlag(step: Pick<StoredStep, "flag" | "lastOp">): boolean {
+  return !step.flag || step.lastOp?.startsWith(IMPORT_OP_PREFIX) === true;
 }
 
 function snippet(s: string): string {
