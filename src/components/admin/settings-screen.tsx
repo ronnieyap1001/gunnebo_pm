@@ -44,6 +44,7 @@ import { makeBackupJob } from "./backup";
 import { callAction, toastError } from "./call";
 import { ago, downloadText, when, ymdIn } from "./format";
 import { Notice } from "./notice";
+import { ProgressImportGroup } from "./progress-import";
 import { SettingsGroup, SettingsRow } from "./settings-section";
 import { useJob } from "./use-job";
 
@@ -338,6 +339,8 @@ export function SettingsScreen({
           </Button>
         </SettingsRow>
       </SettingsGroup>
+
+      <ProgressImportGroup disabled={busy} />
 
       <SettingsGroup id="maintenance" title="Maintenance" description="Checks and repairs. Safe to run at any time; none of them changes values you entered.">
         <SettingsRow

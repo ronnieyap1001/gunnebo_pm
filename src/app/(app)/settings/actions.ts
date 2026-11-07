@@ -20,6 +20,7 @@ import {
   verifyHistoryPage,
   type VerifyHistoryResult,
 } from "@/server/services";
+import { progressFileSchema, runProgressImport, type ProgressReport } from "@/server/services/progressImport";
 
 const ALL_TAGS = [TAGS.library, TAGS.projectFields, TAGS.settings, TAGS.schema];
 const text = (max: number) => z.string().max(max);
@@ -128,6 +129,32 @@ export async function startOverAction(confirmation: string): Promise<ActionResul
     resetEpochCache();
     await startSession();
     return null;
+  });
+}
+
+// ---------------------------------------------------------------------------
+// Import progress (a file prepared from emails: projects, details, milestone values, notes)
+// ---------------------------------------------------------------------------
+
+/** Plans the whole file against the app and writes nothing. */
+export async function previewProgressImportAction(file: unknown): Promise<ActionResult<ProgressReport>> {
+  return runQuery(() => runProgressImport(getRepo(), file, { apply: false }));
+}
+
+/**
+ * Applies one project of the file (the browser calls it once per project, so each call stays well inside the
+ * server's time limit). Safe to repeat: a retry after a timeout continues where the first call stopped.
+ */
+export async function applyProgressProjectAction(file: unknown): Promise<ActionResult<ProgressReport>> {
+  const parsed = progressFileSchema.safeParse(file);
+  if (!parsed.success || parsed.data.projects.length !== 1) {
+    return fail("Send one project at a time. Reload the page and try again.", "VALIDATION");
+  }
+  return runQuery(async () => {
+    const report = await runProgressImport(getRepo(), parsed.data, { apply: true });
+    // New dropdown choices (for example a new customer) change the project fields.
+    updateTag(TAGS.projectFields);
+    return report;
   });
 }
 
