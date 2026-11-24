@@ -1,5 +1,5 @@
 import { beforeEach, describe, expect, it } from "vitest";
-import { setStepValue } from "@/server/services/steps";
+import { setStepFlag, setStepValue } from "@/server/services/steps";
 import { IMPORT_ACTOR, importMayWrite, importOpId, resolveChoice, runProgressImport } from "@/server/services/progressImport";
 import { createProject, seedLibrary, world, type World } from "./_helpers";
 
@@ -90,6 +90,37 @@ describe("progress import", () => {
     expect(r.counts.done).toBe(0);
     expect(w.repo.store.history.length).toBe(historyBefore);
     expect(w.repo.store.notes.size).toBe(notesBefore);
+  });
+
+  it("previews an already imported file as nothing to change (notes and links included)", async () => {
+    await runProgressImport(w.repo, file(), { apply: true });
+    const r = await runProgressImport(w.repo, file());
+    expect(r.counts.error).toBe(0);
+    expect(r.items.filter((i) => i.outcome === "planned")).toEqual([]);
+    expect(r.items.filter((i) => i.what.endsWith(": note") || i.what === "project note" || i.what.includes(" link ")).every((i) => i.outcome === "unchanged")).toBe(true);
+  });
+
+  it("previews a new note or link on an existing project as a change, and only that", async () => {
+    await runProgressImport(w.repo, file(), { apply: true });
+    const later = file({ notes: ["Status 3 Nov: payment proof received, waiting for credit control to confirm.", "Status 10 Nov: paid."] });
+    const spec = later.projects[0] as { steps: Record<string, { links?: unknown[] }> };
+    spec.steps["o2f-shipment-requirements"].links!.push({ name: "Packing list", url: "https://outlook.office365.com/owa/?ItemID=def" });
+    const r = await runProgressImport(w.repo, later);
+    expect(r.items.filter((i) => i.outcome === "planned").map((i) => i.what)).toEqual([
+      "O2F shipment requirements form: link Packing list",
+      'project note "Status 10 Nov: paid."',
+    ]);
+  });
+
+  it("previews a flag set by hand in the app as left as is, like applying does", async () => {
+    await runProgressImport(w.repo, file(), { apply: true });
+    const p = (await w.repo.projects.findByCode("C0381"))!;
+    const bom = (await w.repo.steps.listByProject(p.id)).find((s) => s.milestoneKey === "bom")!;
+    await setStepFlag(w.ctx(), { stepId: bom.id, flag: "BLOCKED", reason: "Set by hand", expectedRev: bom.rev });
+    const preview = await runProgressImport(w.repo, file());
+    const applied = await runProgressImport(w.repo, file(), { apply: true });
+    expect(preview.items.find((i) => i.what.startsWith("BOM: flag"))?.outcome).toBe("skipped");
+    expect(applied.items.find((i) => i.what.startsWith("BOM: flag"))?.outcome).toBe("skipped");
   });
 
   it("never overwrites a value changed in the app, but updates its own earlier values", async () => {
